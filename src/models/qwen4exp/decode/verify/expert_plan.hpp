@@ -88,6 +88,9 @@ struct DecMoe {
     unsigned long long* stage_host = nullptr;
     uint64_t stage_gen = 0;
     int32_t* stage_k = nullptr;
+    uint32_t* stage_warm = nullptr;          ///< device: [n_layers * n_expert] CPU L3 recency stamps
+    uint32_t* stage_warm_host = nullptr;     ///< pinned host shadow updated after CPU misses
+    uint32_t stage_win = 0;                  ///< monotonically incremented per batch window
     cudaStream_t st_s = nullptr;
     cudaEvent_t st_fork = nullptr, st_join = nullptr;
     int64_t stage_stride = 0;

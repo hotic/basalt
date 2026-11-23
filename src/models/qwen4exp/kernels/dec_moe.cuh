@@ -146,13 +146,13 @@ __device__ __forceinline__ void dm_group_keys(const int32_t* s_key, int n, int t
     rank_out = rank;
 }
 
-// The staged share (a card without peers): of the layer's distinct CPU misses (an entry of kind -1 that is its expert's
-// first such entry), the last stage_k[m] in routing order whose blob has a host-RAM address go to kind 1 with every
-// entry of theirs (m: the layer's distinct CPU misses).  Every thread of the block calls it; q is kDmCap words of
-// block scratch.  The ring's kinds and the staged copy (dm_stage_kernel) make the same split from the same ids and
-// residency.
+// The staged share: of the layer's distinct CPU misses (an entry of kind -1 that is its expert's first such entry),
+// pick stage_k[m] eligible misses (blob has a host-RAM address) to stage onto CUDA0 as kind 1.  When stage_warm is set,
+// pick the coldest experts first (smallest stage_warm[e], ties broken by reverse routing order) so recently-used CPU
+// experts stay hot in L3 while cold experts stream over PCIe DMA (__ldcv) without polluting CPU cache.
 __device__ void dm_stage_split(const DmRouteArgs& a, const int32_t* s_ids, int32_t* s_kind, int n, int tid, int32_t* q) {
     if (a.stage_src == nullptr) return;
+    __shared__ uint32_t sw[kDmCap];
     const bool in = tid < n;
     const int32_t e = in ? s_ids[tid] : -1;
     const bool miss = in && s_kind[tid] < 0 && e >= 0 && e < a.n_expert;
@@ -172,13 +172,20 @@ __device__ void dm_stage_split(const DmRouteArgs& a, const int32_t* s_ids, int32
     for (int j = 0; el && j < n; ++j)   // a group holds one entry per token
         if (j != tid && s_ids[j] == e && j / a.k == tid / a.k) el = false;
     __syncthreads();
-    if (tid < kDmCap) q[tid] = el;
+    if (tid < kDmCap) {
+        q[tid] = el;
+        sw[tid] = (el && a.stage_warm != nullptr) ? a.stage_warm[e] : 0u;
+    }
     __syncthreads();
     bool st = false;
     if (el) {
-        int after = 0;
-        for (int j = tid + 1; j < n; ++j) after += q[j];
-        st = after < k;
+        const uint32_t my_w = sw[tid];
+        int colder = 0;
+        for (int j = 0; j < n; ++j) {
+            if (!q[j] || j == tid) continue;
+            if (sw[j] < my_w || (sw[j] == my_w && j > tid)) ++colder;
+        }
+        st = colder < k;
     }
     __syncthreads();
     if (tid < kDmCap) q[tid] = st;
@@ -246,9 +253,10 @@ __device__ void dm_poll_tiers(const DmPlan* plan, const volatile uint32_t* peer_
 // residency rows res0 / res1 (dm_tier_rows), the counts into r_cnt (zeroed: CPU, peer, VRAM, then each further
 // peer's), then the ring's header and every entry's kind (mapped, the further peers' rings, and the plan's with
 // a.kinds).  Ends without a barrier after the header's stores.
-__device__ void dm_ring_head(const DmRouteArgs& a, const int32_t* res0, const int32_t* res1, int tid,
-                             const int32_t* r_ids, int32_t* r_kind, int32_t* r_pf, int32_t* r_cnt) {
-    const int n = a.n_tok * a.k;
+// Shared tier classification for dm_route_kernel, dm_ring_head, and dm_stage_kernel so every consumer derives
+// identical pre-split kinds across primary VRAM, peer GPUs (with peer_cap), further peers, and CPU misses.
+__device__ void dm_classify_kinds(const DmRouteArgs& a, const int32_t* res0, const int32_t* res1, int n, int tid,
+                                  const int32_t* r_ids, int32_t* r_kind, int32_t* r_pf) {
     if (tid < n) {
         const int32_t e = r_ids[tid];
         bool ok = e >= 0 && e < a.n_expert;
@@ -256,7 +264,7 @@ __device__ void dm_ring_head(const DmRouteArgs& a, const int32_t* res0, const in
         r_kind[tid] = ok ? dm_tier_rows(a, res0, res1, e) : -1;
     }
     __syncthreads();
-    if (a.peer_cap > 0) {   // dm_route_kernel's cap: the peer's groups past peer_cap go to the CPU pool
+    if (a.peer_cap > 0) {   // the peer's groups past peer_cap (distinct ids in routing order) go to the CPU pool
         int first = tid;
         const bool pe = tid < n && r_kind[tid] == 2;
         if (pe)
@@ -271,6 +279,12 @@ __device__ void dm_ring_head(const DmRouteArgs& a, const int32_t* res0, const in
         if (pe && rank >= a.peer_cap) r_kind[tid] = -1;
         __syncthreads();
     }
+}
+
+__device__ void dm_ring_head(const DmRouteArgs& a, const int32_t* res0, const int32_t* res1, int tid,
+                             const int32_t* r_ids, int32_t* r_kind, int32_t* r_pf, int32_t* r_cnt) {
+    const int n = a.n_tok * a.k;
+    dm_classify_kinds(a, res0, res1, n, tid, r_ids, r_kind, r_pf);
     dm_stage_split(a, r_ids, r_kind, n, tid, r_pf);
     if (tid < n) {
         if (r_kind[tid] < 0) atomicAdd(&r_cnt[0], 1);

@@ -208,7 +208,11 @@ bool Verifier::dm_init(std::string& err) {
     // is never staged; the addresses are read again before a batch window when the source's places moved (a swap).
     // The count staged for m misses balances the pool's time for the rest against the copy's, both reading host
     // memory at once.
-    bool stage = d->pdev < 0 && d->xp.empty() && lb_ == 0 && le_ == g.n_layers && hand_in_ == nullptr &&
+    // Dual-GPU staging is opt-in (BASALT_DUAL_STAGE=1): on dual-GPU setups with low CPU misses (<3/layer) and fast
+    // X3D CPUs, the 48-layer st_fork/st_join graph tax (~0.37 ms/win) and x8 PCIe copy (~110 us/blob) outweigh CPU time.
+    const char* ds = std::getenv("BASALT_DUAL_STAGE");
+    const bool allow_peer_stage = ds != nullptr && ds[0] == '1' && ds[1] == '\0';
+    bool stage = (allow_peer_stage || (d->pdev < 0 && d->xp.empty())) && lb_ == 0 && le_ == g.n_layers && hand_in_ == nullptr &&
                  warm_src_ != nullptr && staging_ != nullptr && warm_src_->pcie_layer(0) && lay.fmt[0].bytes % 16 == 0;
     for (int64_t l = 1; stage && l < g.n_layers; ++l) stage = lay.fmt[(size_t) l].bytes == lay.fmt[0].bytes;
     const int64_t blob = (int64_t) lay.fmt[0].bytes, stride = dec_moe_stage_stride(blob);
@@ -217,16 +221,22 @@ bool Verifier::dm_init(std::string& err) {
     if (stage && stage_slots >= 1) {
         // per layer: the pool's experts after its doorbell, the staged ones after the copy, their own launches and
         // the combine's wait for them
-        constexpr double kPoolBytesPerUs = 45e3, kLinkBytesPerUs = 18e3, kPoolFixUs = 15.0, kStageFixUs = 35.0;
-        const double cpu_us = (double) blob / kPoolBytesPerUs, link_us = (double) blob / kLinkBytesPerUs;
+        double pool_bps = 45e3, link_bps = 18e3, pool_fix = 15.0, stage_fix = 35.0;
+        if (const char* v = std::getenv("BASALT_STAGE_POOL_GBS")) { const double x = std::atof(v); if (x > 1.0) pool_bps = x * 1e3; }
+        if (const char* v = std::getenv("BASALT_STAGE_LINK_GBS")) { const double x = std::atof(v); if (x > 1.0) link_bps = x * 1e3; }
+        const int min_m_override = std::getenv("BASALT_STAGE_MIN_M") ? std::max(1, std::atoi(std::getenv("BASALT_STAGE_MIN_M"))) : 0;
+        const double cpu_us = (double) blob / pool_bps, link_us = (double) blob / link_bps;
         std::vector<int32_t> kt((size_t) kDmCap + 1, 0);
         for (int m = 1; m <= kDmCap; ++m) {
-            double best = kPoolFixUs + m * cpu_us;
+            if (min_m_override > 0 && m < min_m_override) continue;
+            double best = pool_fix + m * cpu_us;
             for (int k = 1; k <= std::min(m, stage_slots); ++k) {
-                const double t = std::max(kPoolFixUs + (m - k) * cpu_us, kStageFixUs + k * link_us);
+                const double t = std::max(pool_fix + (m - k) * cpu_us, stage_fix + k * link_us);
                 if (t < best) { best = t; kt[(size_t) m] = k; }
             }
         }
+        const char* no_l3 = std::getenv("BASALT_NO_L3_STAGE");
+        const bool l3_stage = !(no_l3 != nullptr && no_l3[0] == '1' && no_l3[1] == '\0');
         int st_least = 0, st_greatest = 0;   // the copy's blocks go first as the FFN read's leave the SMs
         bool sok = cudaMalloc((void**) &d->stage_src, (size_t) LE * 8) == cudaSuccess &&
                    cudaMemset(d->stage_src, 0, (size_t) LE * 8) == cudaSuccess &&
@@ -237,13 +247,26 @@ bool Verifier::dm_init(std::string& err) {
                    cudaStreamCreateWithPriority(&d->st_s, cudaStreamNonBlocking, st_greatest) == cudaSuccess &&
                    cudaEventCreateWithFlags(&d->st_fork, cudaEventDisableTiming) == cudaSuccess &&
                    cudaEventCreateWithFlags(&d->st_join, cudaEventDisableTiming) == cudaSuccess;
+        if (sok && l3_stage) {
+            sok = cudaMalloc((void**) &d->stage_warm, (size_t) LE * 4) == cudaSuccess &&
+                  cudaMemset(d->stage_warm, 0, (size_t) LE * 4) == cudaSuccess &&
+                  cudaMallocHost((void**) &d->stage_warm_host, (size_t) LE * 4) == cudaSuccess;
+            if (sok) std::memset(d->stage_warm_host, 0, (size_t) LE * 4);
+        }
         if (!sok) { err = "verify: the staged share's buffers"; return false; }
         std::memset(d->stage_host, 0, (size_t) LE * 8);
         d->stage_gen = warm_src_->places_generation() + 1;   // read at the first batch window
         d->stage_stride = stride;
         d->stage_blocks = 8;
+        if (const char* sb = std::getenv("BASALT_STAGE_BLOCKS")) {
+            const int b = std::atoi(sb);
+            if (b >= 4 && b <= 64) d->stage_blocks = b;
+        }
         d->stage_min = 1;
         while (d->stage_min < kDmCap && kt[(size_t) d->stage_min] == 0) ++d->stage_min;
+        basalt::log::info("basalt verify", "staged PCIe share ON%s: min_m=%d, kt[3..8]=[%d,%d,%d,%d,%d,%d], blocks=%d, l3_cold_first=%d",
+                          d->pdev >= 0 ? " (dual-GPU)" : "", d->stage_min,
+                          kt[3], kt[4], kt[5], kt[6], kt[7], kt[8], d->stage_blocks, d->stage_warm != nullptr ? 1 : 0);
     }
     std::string served;
     if (d->pdev >= 0) {
@@ -289,9 +312,10 @@ void Verifier::dm_free() {
     for (void* p : {(void*) d->res0, (void*) d->res1, (void*) d->plan, (void*) d->ctr, (void*) d->slot_off, d->vscr,
                     (void*) d->vsync, d->xq_pub, (void*) d->wstat,
                     (void*) d->ptab0, (void*) d->pub, (void*) d->cseen, (void*) d->landed,
-                    (void*) d->stage_src, (void*) d->stage_k, (void*) d->route_counts})
+                    (void*) d->stage_src, (void*) d->stage_k, (void*) d->stage_warm, (void*) d->route_counts})
         if (p) cudaFree(p);
     if (d->stage_host) cudaFreeHost(d->stage_host);
+    if (d->stage_warm_host) cudaFreeHost(d->stage_warm_host);
     if (d->pin) cudaFreeHost(d->pin);
     if (d->landed_pin) cudaFreeHost(d->landed_pin);
     for (void* h : {(void*) d->h_ring, (void*) d->h_x, (void*) d->h_xq, (void*) d->h_w, (void*) d->h_rows})

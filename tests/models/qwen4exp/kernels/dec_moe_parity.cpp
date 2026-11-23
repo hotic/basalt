@@ -1309,6 +1309,84 @@ int main(int argc, char** argv) {
                     report(what, l, badg, (size_t) n);
                     cudaFree(d_pt); cudaFree(d_pub); cudaFree(d_p4);
                 }
+                // dual-GPU staged split (res1 + peer_cap + L3 stage_warm cold-first): verifies dm_route_kernel,
+                // dm_stage_kernel, and dm_glue agree bitwise when peer residency, peer_cap, and L3 warmth are active
+                {
+                    std::vector<uint32_t> h_warm(NE, 0u);
+                    for (int e = 0; e < NE; ++e) h_warm[(size_t) e] = (uint32_t) ((e * 37 + 11) % 7);
+                    uint32_t* d_warm = dmal<uint32_t>(NE);
+                    ck(cudaMemcpy(d_warm, h_warm.data(), NE * 4, cudaMemcpyHostToDevice), "stage warm");
+                    const int pcap = 2;
+                    std::vector<int32_t> dk(n);
+                    for (int i = 0; i < n; ++i)
+                        dk[i] = res0[ids[i]] >= 0 ? 0 : res1[ids[i]] >= 0 ? 2 : -1;
+                    // peer_cap on kind==2
+                    std::vector<int> pseen;
+                    for (int i = 0; i < n; ++i) {
+                        if (dk[i] != 2) continue;
+                        int rk_id = -1;
+                        for (size_t j = 0; j < pseen.size(); ++j) if (pseen[j] == ids[i]) { rk_id = (int) j; break; }
+                        if (rk_id < 0) { rk_id = (int) pseen.size(); pseen.push_back(ids[i]); }
+                        if (rk_id >= pcap) dk[i] = -1;
+                    }
+                    std::vector<int> dfirsts;
+                    for (int i = 0; i < n; ++i) {
+                        bool f = dk[i] < 0;
+                        for (int j = 0; f && j < i; ++j) f = !(ids[j] == ids[i] && dk[j] < 0);
+                        if (f) dfirsts.push_back(i);
+                    }
+                    const int dm_cnt = (int) dfirsts.size(), dkk = kt[(size_t) dm_cnt];
+                    std::vector<int> delig;
+                    for (int i : dfirsts) if (src[(size_t) ids[i]] != 0ull) delig.push_back(i);
+                    std::vector<int> dstaged;
+                    for (int i : delig) {
+                        const uint32_t my_w = h_warm[(size_t) ids[i]];
+                        int colder = 0;
+                        for (int j : delig) {
+                            if (j == i) continue;
+                            const uint32_t wj = h_warm[(size_t) ids[j]];
+                            if (wj < my_w || (wj == my_w && j > i)) ++colder;
+                        }
+                        if (colder < dkk) dstaged.push_back(ids[i]);
+                    }
+                    auto dis_st = [&](int e) { return std::find(dstaged.begin(), dstaged.end(), e) != dstaged.end(); };
+                    int drnc = 0, drnp = 0;
+                    for (int i = 0; i < n; ++i) {
+                        if (dk[i] < 0 && dis_st(ids[i])) dk[i] = 1;
+                        drnc += dk[i] < 0;
+                        drnp += dk[i] == 2;
+                    }
+                    K::DmRouteArgs rdp = rs;
+                    rdp.res1 = d_res1;
+                    rdp.peer_cap = pcap;
+                    rdp.stage_warm = d_warm;
+                    ck(cudaMemsetAsync(d_plan, 0xee, sizeof(K::DmPlan), s0), "memset");
+                    std::memset((void*) (h_rings + 5), 0, sizeof(K::DmRing));
+                    K::dec_moe_route(rdp, s0);
+                    K::dec_moe_stage(rdp, d_stg, stride, (int64_t) L.bytes, 8, s0);
+                    ck(cudaStreamSynchronize(s0), "dual staged route");
+                    K::DmPlan DS;
+                    ck(cudaMemcpy(&DS, d_plan, sizeof DS, cudaMemcpyDeviceToHost), "dual plan");
+                    size_t bad_ds = 0;
+                    for (int i = 0; i < n; ++i) bad_ds += DS.kind[i] != dk[i] || h_rings[5].kind[i] != dk[i];
+                    bad_ds += h_rings[5].n_cpu != drnc || DS.counts[3] != drnc || DS.counts[2] != drnp ||
+                              DS.scounts[0] != (int) dstaged.size();
+                    const auto dstg = down(d_stg, (size_t) K::kDmStageMax * stride);
+                    for (int g = 0; g < DS.scounts[0] && g < K::kDmStageMax; ++g) {
+                        const int e0 = DS.sstart[g], e1 = DS.sstart[g + 1];
+                        const int ex = e1 > e0 && DS.sdst[e0] >= 0 && DS.sdst[e0] < n ? ids[DS.sdst[e0]] : -1;
+                        bad_ds += ex < 0 || !dis_st(ex);
+                        const unsigned long long off = DS.sptr[g] - (unsigned long long) (d_stg + (size_t) g * stride);
+                        bad_ds += ex < 0 || off != (src[(size_t) ex] & 127ull);
+                        if (ex >= 0 && off < 128)
+                            bad_ds += std::memcmp(dstg.data() + (size_t) g * stride + off,
+                                                  blobs.data() + (size_t) (ex % NX) * L.bytes, L.bytes) != 0;
+                    }
+                    std::snprintf(what, sizeof what, "dual+l3_warm staged split T=%d (%d of %d misses)", T,
+                                  (int) dstaged.size(), dm_cnt);
+                    report(what, l, bad_ds, (size_t) n);
+                    cudaFree(d_warm);
+                }
                 if (bench && !staged.empty())   // the copy over the link alone, by the blocks it launches
                     for (int blocks : {8, 16, 32, 64}) {
                         const double us = time_us(s0, 100, [&] {

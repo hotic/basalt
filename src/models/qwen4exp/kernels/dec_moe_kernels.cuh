@@ -18,31 +18,7 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
     if (tid < kDmMaxX) s_nx[tid] = 0;
     if (tid < n) s_ids[tid] = a.ids[tid];
     __syncthreads();
-    if (tid < n) {
-        const int32_t e = s_ids[tid];
-        // an id past the table or repeated within its token goes to the CPU pool: a device group then holds at most
-        // one entry per token (kDmMaxEnt, the persistent kernels' shared rows)
-        bool ok = e >= 0 && e < a.n_expert;
-        for (int j = tid - tid % a.k; ok && j < tid; ++j) ok = s_ids[j] != e;
-        s_kind[tid] = ok ? dm_tier(a, e) : -1;
-    }
-    __syncthreads();
-    if (a.peer_cap > 0) {   // the peer's groups past peer_cap (distinct ids in routing order) go to the CPU pool
-        __shared__ int32_t s_pf[kDmCap];
-        int first = tid;
-        const bool pe = tid < n && s_kind[tid] == 2;
-        if (pe)
-            for (int j = 0; j < tid; ++j)
-                if (s_ids[j] == s_ids[tid] && s_kind[j] == 2) { first = j; break; }
-        if (tid < kDmCap) s_pf[tid] = pe && first == tid;
-        __syncthreads();
-        int rank = 0;
-        if (pe)
-            for (int j = 0; j < first; ++j) rank += s_pf[j];
-        __syncthreads();
-        if (pe && rank >= a.peer_cap) s_kind[tid] = -1;
-        __syncthreads();
-    }
+    dm_classify_kinds(a, a.res0, a.res1, n, tid, s_ids, s_kind, s_first);
     dm_stage_split(a, s_ids, s_kind, n, tid, s_first);
     if (tid < n) {
         if (s_kind[tid] < 0) atomicAdd(&s_ncpu, 1);
@@ -178,13 +154,7 @@ __global__ void __launch_bounds__(kDmThreads) dm_stage_kernel(DmRouteArgs a, uin
     const int tid = threadIdx.x, n = a.n_tok * a.k;
     if (tid < n) s_ids[tid] = __ldcg(a.ids + tid);
     __syncthreads();
-    if (tid < n) {
-        const int32_t e = s_ids[tid];
-        bool ok = e >= 0 && e < a.n_expert;
-        for (int j = tid - tid % a.k; ok && j < tid; ++j) ok = s_ids[j] != e;
-        s_kind[tid] = ok && a.res0[e] >= 0 ? 0 : -1;
-    }
-    __syncthreads();
+    dm_classify_kinds(a, a.res0, a.res1, n, tid, s_ids, s_kind, s_first);
     dm_stage_split(a, s_ids, s_kind, n, tid, s_first);
     dm_group(s_ids, s_kind, n, 1, tid, s_first, s_cnt, s_gstart, s_gidx, s_pos, s_start, &s_ng, &s_ne);
     const int ng = min(s_ng, kDmStageMax);

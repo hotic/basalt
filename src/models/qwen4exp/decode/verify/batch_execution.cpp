@@ -161,6 +161,16 @@ bool Verifier::run_slot_segs(const int* rows, const int* lens, int S, const int3
     const bool dm = dm_ != nullptr && batch_dm_;
     if (dm && !dm_begin(err, nullptr)) return false;
     if (dm && !dm_stage_places(err)) return false;
+    if (dm && dm_->stage_warm != nullptr) {
+        ++dm_->stage_win;
+        if (dm_->stage_win > 1) {
+            const int64_t LE = g.n_layers * g.n_expert;
+            if (cudaMemcpyAsync(dm_->stage_warm, dm_->stage_warm_host, (size_t) LE * 4, cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
+                err = std::string("verify: stage_warm upload: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+        }
+    }
     order_after_commit();
     set_head_keep(0);   // the slots sample with their own parameters: every row exact
     if (ar_on() && h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
@@ -215,6 +225,17 @@ bool Verifier::run_slot_segs(const int* rows, const int* lens, int S, const int3
             sink_.ext_kind = Rg.kind;
             if (pool != nullptr) pool(user, dm_->h_x + (size_t) k * dm_->x_stride, Rg.ids, R, ss_->k, h_ymiss_, l);
             sink_.ext_kind = nullptr;
+            if (dm_->stage_warm_host != nullptr) {
+                uint32_t* const wh = dm_->stage_warm_host + (size_t) l * g.n_expert;
+                const uint32_t win = dm_->stage_win;
+                const int nent = R * (int) ss_->k;
+                for (int i = 0; i < nent; ++i) {
+                    if (Rg.kind[i] < 0) {
+                        const int32_t e = Rg.ids[i];
+                        if (e >= 0 && e < (int32_t) g.n_expert) wh[e] = win;
+                    }
+                }
+            }
         } else if (pool != nullptr) pool(user, h_x_, h_ids_, R, ss_->k, h_ymiss_, l);
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);

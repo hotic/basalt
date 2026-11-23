@@ -91,10 +91,12 @@ struct DmRouteArgs {
     /// for the layer's next window
     unsigned int* pub_ctr = nullptr;
     unsigned int pub_target = 0;
-    /// the staged share (a card without peers): this layer's [n_expert] host-RAM blob address (device alias) or 0,
-    /// and per count of the layer's distinct CPU misses the staged ones (kDmCap + 1 entries, device); null: none
+    /// the staged share: this layer's [n_expert] host-RAM blob address (device alias) or 0, per count of the
+    /// layer's distinct CPU misses the staged ones (kDmCap + 1 entries, device), and optional [n_expert] L3 recency
+    /// stamps (larger = warmer in CPU L3 -> keep on CPU, smaller = colder -> stage over PCIe); null: none / routing order
     const unsigned long long* stage_src = nullptr;
     const int32_t* stage_k = nullptr;
+    const uint32_t* stage_warm = nullptr;
 };
 /// Blocks dec_moe_route launches for `n_tok` rows (the arrival counter advances by this much).
 int dec_moe_route_blocks(int n_tok, int n_embd);
