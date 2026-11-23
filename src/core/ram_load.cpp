@@ -13,6 +13,10 @@
 #include <mutex>
 #include <thread>
 #include <utility>
+#include <cstdlib>
+#if !defined(_WIN32)
+#include <sys/mman.h>
+#endif
 
 namespace basalt::core {
 
@@ -214,7 +218,16 @@ uint64_t ram_padded(uint64_t bytes) {
 }
 
 uint8_t* alloc_ram(uint64_t bytes) {
-    return (uint8_t*) platform::alloc_aligned((size_t) ram_padded(bytes), 2ull << 20);
+    const uint64_t padded = ram_padded(bytes);
+    uint8_t* p = (uint8_t*) platform::alloc_aligned((size_t) padded, 2ull << 20);
+#if !defined(_WIN32)
+    if (p != nullptr) {
+        const char* no_thp = std::getenv("BASALT_NO_RAM_THP");
+        if (!(no_thp != nullptr && no_thp[0] == '1' && no_thp[1] == '\0'))
+            (void) madvise(p, (size_t) padded, MADV_HUGEPAGE);
+    }
+#endif
+    return p;
 }
 
 RamAllocation::~RamAllocation() { reset(); }
