@@ -95,9 +95,13 @@ bool Verifier::WindowRecorder::post(int64_t l) {
             }
             cudaEventRecord(v_.lz_fork_, cs);
             cudaStreamWaitEvent(v_.lz_s_, v_.lz_fork_, 0);
-            gdn_commit_lazy(lazy_args, v_.commit_ctl_,
-                            lazy_layer(l + 1) ? (int) (gdn_idx[(size_t) (l + 1)] - gdn_first) : 0,
-                            v_.dm_->tags ? v_.dm_->cseen : nullptr, ring, v_.lz_s_, v_.fin_blocks_, &pf);
+            const int must_l = lazy_layer(l + 1) ? (int) (gdn_idx[(size_t) (l + 1)] - gdn_first) : 0;
+            if (v_.batch_rec_)
+                gdn_commit_lazy_seg(lazy_seg_args, v_.d_seg_nrows_, v_.commit_ctl_, must_l,
+                                    v_.dm_->tags ? v_.dm_->cseen : nullptr, ring, v_.lz_s_, v_.fin_blocks_, &pf);
+            else
+                gdn_commit_lazy(lazy_args, v_.commit_ctl_, must_l,
+                                v_.dm_->tags ? v_.dm_->cseen : nullptr, ring, v_.lz_s_, v_.fin_blocks_, &pf);
             cudaEventRecord(v_.lz_join_, v_.lz_s_);
             lz_open = true;
         }

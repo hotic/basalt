@@ -30,15 +30,16 @@ bool MtpDrafter::draft_rows(int T, const int32_t* tokens, int64_t p, int a, int3
         for (int t = 0; t <= a; ++t) ctx_note(tokens[t]);
         ctx_flush(cs_);
     }
-    const int max_steps = std::min(max_t_ - 1, max_drafts_);
+    const int full_steps = std::min(max_t_ - 1, max_drafts_);
+    const int max_steps = call_max_drafts_ > 0 ? std::min(full_steps, call_max_drafts_) : full_steps;
     if (!tier2_.empty()) {   // every row for a while after a token only the added rows hold
         for (int t = 0; t < T; ++t)
             if (tokens[t] >= 0 && tokens[t] < (int32_t) tier2_.size() && tier2_[(size_t) tokens[t]]) tier2_recent_ = 32;
         tier_ = tier2_recent_ > 0 ? 1 : 0;
         if (tier2_recent_ > 0) --tier2_recent_;
     }
-    // the chain in one graph (falls back to the graphs below for good if it cannot be built)
-    const bool cond = !cond_off_ && max_steps > 1 && capture_cond(T, max_steps);
+    // the chain in one graph (always capture with full_steps so per-call caps never trigger recapture)
+    const bool cond = !cond_off_ && max_steps > 1 && capture_cond(T, full_steps);
     if (!cond) {
         if (!capture_round(T, err)) return false;
         for (int j = 1; j < max_steps; ++j)
@@ -63,7 +64,7 @@ bool MtpDrafter::draft_rows(int T, const int32_t* tokens, int64_t p, int a, int3
     for (int j = 0; j < max_steps; ++j) ((volatile int32_t*) h_out_)[j] = -1;
     h_row_[0] = a;
     h_row_[1] = 0;
-    // slot 2 is reserved: the row layout is fixed by the graphs that copy it
+    h_row_[2] = call_max_drafts_ > 0 ? max_steps : 0;   // per-call step cap read by conditional nodes (0 = unlimited)
     const float cum_th = cum_th_ >= 0.0f ? cum_th_ : draft_cum_base();
     std::memcpy(&h_row_[3], &cum_th, sizeof(float));   // the window's threshold, read by the conditional graph
     std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -105,8 +106,8 @@ bool MtpDrafter::draft_rows(int T, const int32_t* tokens, int64_t p, int a, int3
             }
         };
         wait_step(0);
-        // every draft arrived: the graph's kernels are done, only its skipped steps' conditional nodes remain
-        bool arrived = cond && ((volatile int32_t*) h_out_)[0] >= 0;
+        // every draft arrived: the graph's kernels are done (or 1-step round_exec_ ended at step_end(0))
+        bool arrived = (cond || max_steps == 1) && ((volatile int32_t*) h_out_)[0] >= 0;
         drafts[0] = ((volatile int32_t*) h_out_)[0];
         float pr[kMtpChainMax];
         float pj = ((volatile float*) h_prob_)[0];
@@ -172,8 +173,11 @@ bool MtpDrafter::draft_rows(int T, const int32_t* tokens, int64_t p, int a, int3
 // holding its SMs until the host serves its rings, and the chain's kernels would wait behind it.
 cudaEvent_t MtpDrafter::done_event() {
     const OnDevice on_device(device_);
-    if (ev_done_ == nullptr && cudaEventCreateWithFlags(&ev_done_, cudaEventDisableTiming) != cudaSuccess) return nullptr;
-    cudaEventRecord(ev_done_, cs_);
+    if (ev_done_ == nullptr && cudaEventCreateWithFlags(&ev_done_, cudaEventDisableTiming) != cudaSuccess) {
+        ev_done_ = nullptr;
+        return nullptr;
+    }
+    if (cudaEventRecord(ev_done_, cs_) != cudaSuccess) return nullptr;
     return ev_done_;
 }
 

@@ -78,6 +78,8 @@ public:
     void note_candidates(const int32_t* ids, int n);
     /// At most this many drafts per round (below max_t - 1): a window longer than the MTP's comes from elsewhere.
     void set_max_drafts(int k) { max_drafts_ = k; }
+    /// Per-call draft cap (0 = use set_max_drafts); enforced via mapped h_row_[2] without recapturing cond graphs.
+    void set_call_max_drafts(int k) { call_max_drafts_ = k; }
     /// Captures every conditional draft graph (each draft-head tier, each window width) now rather than at its first
     /// use. After `bind` and `set_max_drafts`.
     bool prewarm(std::string& err);
@@ -225,6 +227,7 @@ private:
     int max_t_ = 0;
     int device_ = -1;   ///< the device `load` ran on: the public calls switch to it (layer split)
     int max_drafts_ = 1 << 30;
+    int call_max_drafts_ = 0;
     int64_t n_vocab_ = 0;
     uint64_t vram_ = 0;
     cudaStream_t cs_ = nullptr;

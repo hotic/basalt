@@ -57,6 +57,10 @@ bool Verifier::finisher_on() const {
 
 bool Verifier::lazy_on() const { return finisher_on() && dm_ != nullptr && gs_nk0_ == 0 && lz_s_ != nullptr; }
 
+bool Verifier::batch_lazy_on() const {
+    return lazy_on() && segb_commit_ != nullptr && d_seg_nrows_ != nullptr;
+}
+
 // the stage's GDN layers after its first, the lazy ones
 basalt::kernels::GdnCommitLayers Verifier::commit_gdn_lazy_args() const {
     const ModelGeometry& g = *g_;
@@ -65,6 +69,34 @@ basalt::kernels::GdnCommitLayers Verifier::commit_gdn_lazy_args() const {
     for (int64_t l = lb_; l < le_; ++l) n += is_qsa_layer(g, l) ? 0 : 1;
     basalt::kernels::GdnCommitLayers ga = commit_gdn_layer(gdn_index + 1);
     ga.n_layers = (int) std::max<int64_t>(n - 1, 0);
+    return ga;
+}
+
+basalt::kernels::GdnCommitSeg Verifier::commit_gdn_lazy_seg_args() const {
+    using namespace basalt::kernels;
+    const ModelGeometry& g = *g_;
+    const int64_t C = g.ssm_conv_channels, HV = g.ssm_v_heads, MT = max_t_;
+    const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
+                                (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
+    int64_t gdn_index = 0, n = 0;
+    for (int64_t l = 0; l < lb_; ++l) gdn_index += is_qsa_layer(g, l) ? 0 : 1;
+    for (int64_t l = lb_; l < le_; ++l) n += is_qsa_layer(g, l) ? 0 : 1;
+    const int64_t g1 = gdn_index + 1;
+    GdnCommitSeg ga;
+    ga.rows = segb_commit_;
+    ga.state_off = (size_t) g1 * gdn_floats;
+    ga.state_stride = gdn_floats;
+    ga.h = h_L_ + (size_t) g1 * MT * C;
+    ga.qkv = qkv_L_ + (size_t) g1 * MT * C;
+    ga.gate = gate_L_ + (size_t) g1 * MT * HV;
+    ga.beta = beta_L_ + (size_t) g1 * MT * HV;
+    ga.h_stride = (size_t) MT * C;
+    ga.gb_stride = (size_t) MT * HV;
+    ga.C = (int) C;
+    ga.h_k = (int) g.ssm_k_heads;
+    ga.h_v = (int) HV;
+    ga.n_layers = (int) std::max<int64_t>(n - 1, 0);
+    ga.n_rows = max_t_;
     return ga;
 }
 
@@ -78,6 +110,14 @@ void Verifier::apply_lazy() {
     commit_pending_ = true;
 }
 
+void Verifier::apply_batch_lazy() {
+    if (!batch_lz_pending_) return;
+    batch_lz_pending_ = false;
+    const basalt::kernels::GdnCommitSeg la = commit_gdn_lazy_seg_args();
+    if (la.n_layers > 0)
+        basalt::kernels::gdn_commit_lazy_seg(la, d_seg_nrows_, commit_ctl_, la.n_layers, nullptr, 0, cs_, fin_blocks_);
+}
+
 bool Verifier::commit_begun() const {
     const Clock::time_point t0 = Clock::now();
     while (*(volatile uint32_t*) h_pend_ != commit_epoch_) {
@@ -86,7 +126,8 @@ bool Verifier::commit_begun() const {
     return true;
 }
 
-void Verifier::order_after_commit(bool solo) {
+void Verifier::order_after_commit(bool solo, bool keep_batch_lazy) {
+    if (!keep_batch_lazy) apply_batch_lazy();
     if (!solo) apply_lazy();
     if (commit_pending_) cudaStreamWaitEvent(cs_, commit_done_, 0);
 }
@@ -205,6 +246,12 @@ bool Verifier::commit(int n_keep, std::string& err, int parts) {
 }
 
 bool Verifier::wait_commit(std::string& err) {
+    if (batch_lz_pending_) {
+        const OnDevice on_device(device_);
+        apply_batch_lazy();
+        const cudaError_t se = cudaStreamSynchronize(cs_);
+        if (se != cudaSuccess) { err = std::string("verify: batch lazy commit: ") + cudaGetErrorString(se); return false; }
+    }
     if (commit_pending_ || lz_pending_) {
         const OnDevice on_device(device_);
         apply_lazy();

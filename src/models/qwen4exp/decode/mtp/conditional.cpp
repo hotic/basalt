@@ -15,8 +15,10 @@ bool MtpDrafter::prewarm(std::string& err) {
     bool ok = true;
     for (int tier = 0; ok && tier < (tier2_.empty() ? 1 : 2); ++tier) {
         tier_ = tier2_.empty() ? saved : tier;
-        for (int T = 1; ok && T <= std::min(max_t_, basalt::kernels::kVerifyMaxT) && !cond_off_; ++T)
+        for (int T = 1; ok && T <= std::min(max_t_, basalt::kernels::kVerifyMaxT) && !cond_off_; ++T) {
             ok = capture_cond(T, max_steps);
+            if (ok) (void) capture_round(T, err);
+        }
     }
     tier_ = saved;
     if (!ok && cond_off_) return true;   // the per-step graphs take over, as at a lazy failure
@@ -53,7 +55,7 @@ bool MtpDrafter::capture_cond(int T, int steps) {
         bool rec = record_round(T, true, err);
         ctail_ = nullptr;
         if (rec && !ctail_done_)
-            rec = mtp_draft_cond(hv + 1, steps - 1, probs_, row_ + 1, row_ + 3, cs_, m_prob_, 0);
+            rec = mtp_draft_cond(hv + 1, steps - 1, probs_, row_ + 1, row_ + 3, cs_, m_prob_, 0, row_ + 2);
         cudaGraph_t g0 = nullptr;
         const bool ended = cudaStreamEndCapture(cs_, &g0) == cudaSuccess;
         ok = rec && ended && g0 != nullptr && cudaGraphAddChildGraphNode(&prev, top, nullptr, 0, g0) == cudaSuccess;
@@ -80,7 +82,7 @@ bool MtpDrafter::capture_cond(int T, int steps) {
         bool rec = record_step(j, false, err);
         ctail_ = nullptr;
         if (rec && j + 1 < steps && !ctail_done_)
-            rec = mtp_draft_cond(hv + j + 1, 1, probs_, row_ + 1, row_ + 3, cs_, m_prob_, j);
+            rec = mtp_draft_cond(hv + j + 1, 1, probs_, row_ + 1, row_ + 3, cs_, m_prob_, j, row_ + 2);
         cudaGraph_t captured = nullptr;   // the body itself, owned by the node
         ok = cudaStreamEndCapture(cs_, &captured) == cudaSuccess && rec;
         prev = node;

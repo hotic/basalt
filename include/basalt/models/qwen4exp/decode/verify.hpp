@@ -163,6 +163,7 @@ public:
     /// kernels::kLogprobStride floats a row to `host` (basalt/kernels/logprobs.hpp). Valid after run().
     bool row_logprobs(int t0, int n, const int32_t* picks, int top, float* host);
     int64_t vocab() const { return next_ ? next_->vocab() : n_vocab_; }
+    int device() const { return device_; }
     /// The sampling the verify window's head applies (temperature / top_p / top_k / seed).  Set per
     /// request; greedy by default.  The sampling itself runs OUTSIDE the captured graph - its
     /// parameters would otherwise be baked forever - so this can change between requests freely.
@@ -473,6 +474,7 @@ private:
     /// slots the rows are is data (the staged segment tables), so a membership change re-records nothing.
     std::map<uint64_t, cudaGraphExec_t> exec_bm_;
     std::map<int, cudaGraphExec_t> commit_bm_;
+    std::map<int, bool> commit_bm_lazy_;
     int last_rows_[8] = {};                ///< the slot of each row of the last batch window
     const int32_t* bh_d_ = nullptr;        ///< set_batch_history
     int bh_len_ = 0;
@@ -499,6 +501,8 @@ private:
     /// the commit, so the GDN kernels take slot identity as data.
     basalt::kernels::SegRow* h_segb_ = nullptr; basalt::kernels::SegRow* m_segb_ = nullptr;
     basalt::kernels::SegRow* segb_ = nullptr;
+    basalt::kernels::SegRow* segb_commit_ = nullptr;   ///< previous batch commit's SegRow snapshot for lazy GDN drain
+    int32_t* d_seg_nrows_ = nullptr;                   ///< row count of segb_commit_
     /// The QSA chain's segment tables (qsa_seg.hpp): one entry per row and per segment, staged with the segment table;
     /// the per-layer, per-slot pointers are uploaded once.
     basalt::kernels::QsaSeg* h_qseg_ = nullptr; basalt::kernels::QsaSeg* m_qseg_ = nullptr;
@@ -636,16 +640,20 @@ private:
     // previous layer's combine waits for the CPU pool or the peer's rows.
     cudaStream_t lz_s_ = nullptr;
     cudaEvent_t lz_fork_ = nullptr, lz_join_ = nullptr;
-    bool lz_pending_ = false;                       ///< a commit whose lazy layers no window has applied yet
+    bool lz_pending_ = false;                       ///< a solo commit whose lazy layers no window has applied yet
+    bool batch_lz_pending_ = false;                 ///< a batch commit whose lazy layers no batch window has applied yet
     bool finisher_on() const;                        ///< solo windows start with the finisher
     bool lazy_on() const;                            ///< the GDN layers after the first are committed lazily
+    bool batch_lazy_on() const;                      ///< segmented batch GDN layers after layer 0 commit lazily
     bool commit_begun() const;                       ///< the begin kernel of the last async commit has run
     /// a launch on cs_ outside the solo windows follows the async commit (and its lazy layers, unless `solo`)
-    void order_after_commit(bool solo = false);
-    void apply_lazy();                               ///< the pending lazy layers on cm_, before commit_done_
+    void order_after_commit(bool solo = false, bool keep_batch_lazy = false);
+    void apply_lazy();                               ///< the pending solo lazy layers on cm_, before commit_done_
+    void apply_batch_lazy();                         ///< the pending batch lazy layers on cs_
     basalt::kernels::GdnCommitLayers commit_gdn_args() const;
     basalt::kernels::GdnCommitLayers commit_gdn_layer(int64_t gdn_index) const;   ///< one GDN layer's commit
     basalt::kernels::GdnCommitLayers commit_gdn_lazy_args() const;              ///< the lazy layers' commit
+    basalt::kernels::GdnCommitSeg commit_gdn_lazy_seg_args() const;             ///< the batch lazy layers' commit
     static void raise_flag_b(void* ctx);
     static void raise_flag(uint32_t* flag, uint32_t value);
     int32_t* h_plan_ = nullptr;  int32_t* m_plan_ = nullptr;     // counts | start | dst | tok | ptr (as int32 pairs)

@@ -81,21 +81,25 @@ bool Verifier::capture_commit_batch(int R, std::string& err) {
         err = "verify: begin batch commit capture failed";
         return false;
     }
+    const bool blazy = batch_lazy_on();
     bool ok = true;
     try {
+        SegRow* const seg_dst = blazy ? segb_commit_ : segb_;
         copy_i32_from_mapped(commitb_, m_commitb_, (int64_t) slots_.size() * CB, cs_);
-        copy_i32_from_mapped((int32_t*) segb_, (const int32_t*) m_segb_, (int64_t) R * 8, cs_);
+        copy_i32_from_mapped((int32_t*) seg_dst, (const int32_t*) m_segb_, (int64_t) R * 8, cs_);
         copy_i32_from_mapped((int32_t*) d_qrows_, (const int32_t*) m_qseg_, (int64_t) (kQsaSegMaxRows + 8) * 4, cs_);
+        if (blazy) gdn_commit_lazy_seg_begin(commit_ctl_, d_seg_nrows_, R, cs_);
         int64_t qsa_index = 0, gdn_index = 0;
         for (int64_t l = 0; l < lb_; ++l) (is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
-        {   // every segment's GDN layers in one launch (the keep counts come from the table)
+        {   // every segment's GDN layers (only layer 0 here when batch_lazy_on: layers 1..35 drain inside the next window)
             GdnCommitSeg ga;
-            ga.rows = segb_; ga.state_off = (size_t) gdn_index * gdn_floats; ga.state_stride = gdn_floats;
+            ga.rows = seg_dst; ga.state_off = (size_t) gdn_index * gdn_floats; ga.state_stride = gdn_floats;
             ga.h = h_L_ + (size_t) gdn_index * MT * C; ga.qkv = qkv_L_ + (size_t) gdn_index * MT * C;
             ga.gate = gate_L_ + (size_t) gdn_index * MT * HV; ga.beta = beta_L_ + (size_t) gdn_index * MT * HV;
             ga.h_stride = (size_t) MT * C; ga.gb_stride = (size_t) MT * HV;
             ga.C = (int) C; ga.h_k = (int) g.ssm_k_heads; ga.h_v = (int) HV; ga.n_rows = R;
             for (int64_t l = lb_; l < le_; ++l) ga.n_layers += is_qsa_layer(g, l) ? 0 : 1;
+            if (blazy) ga.n_layers = std::min(ga.n_layers, 1);
             gdn_commit_layers_seg(ga, cs_, kCommitBlocks);
         }
         {   // every QSA layer's indexer tail restore and appends, per segment, in one launch
@@ -114,7 +118,7 @@ bool Verifier::capture_commit_batch(int R, std::string& err) {
             }
             if (ok) native_qsa_indexer_commit_seg(qc, s, rope_scaling(), cs_);
         }
-        if (ok && ss_->ple.ready() && ple_stage()) ple_hist_scatter(d_ple_slots_, hist_snap_, segb_, HS, R, cs_);
+        if (ok && ss_->ple.ready() && ple_stage()) ple_hist_scatter(d_ple_slots_, hist_snap_, seg_dst, HS, R, cs_);
     } catch (const std::exception& e) {
         err = std::string("verify batch commit: ") + e.what();
         ok = false;
@@ -130,7 +134,9 @@ bool Verifier::capture_commit_batch(int R, std::string& err) {
         err = std::string("verify: batch commit capture: ") + cudaGetErrorString(ce);
         return false;
     }
-    return instantiate_batch(cex, graph, err);
+    if (!instantiate_batch(cex, graph, err)) return false;
+    commit_bm_lazy_[R] = blazy;
+    return true;
 }
 
 }  // namespace basalt::core

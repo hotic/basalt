@@ -36,7 +36,7 @@ bool MtpDrafter::step_end(int j) {
     using namespace basalt::kernels;
     const CondTail* c = ctail_;
     if (!mtp_step_end(out_ids_, row_ + 1, tok_, m_out_, j, probs_, m_prob_, c ? c->h : nullptr, c ? c->n : 0, row_ + 3,
-                      m_prob_, cs_))
+                      m_prob_, cs_, c ? row_ + 2 : nullptr))
         return false;
     ctail_done_ = c != nullptr;
     return true;

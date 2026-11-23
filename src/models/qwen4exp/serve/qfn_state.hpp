@@ -344,6 +344,7 @@ private:
     std::vector<float> lh_buf{};
     bool batch_adapt{};
     int64_t ba_win{};
+    int64_t ba_since_adapt{};
     int64_t ba_swaps{};
     int64_t ba_rounds{};
     int64_t ba_swaps_l{};

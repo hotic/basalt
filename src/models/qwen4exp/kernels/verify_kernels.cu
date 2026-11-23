@@ -473,18 +473,210 @@ __global__ void __launch_bounds__(32 * RG) gdn_commit_lazy_kernel(GdnCommitLayer
     if (acc == 0x9e3779b9u) ctl->w[(size_t) kCtlWords * 10 + 1] = acc;   // keeps the reads (never in practice)
 }
 
-// the same over a segmented window: blockIdx.y = the window row whose segment it commits (only a segment's first row)
-__global__ void __launch_bounds__(32 * RG) gdn_commit_layers_seg_kernel(GdnCommitSeg s, int conv_blocks) {
-    const SegRow r = s.rows[blockIdx.y];
-    const int n = min(r.n_keep, kVerifyMaxT);
-    if (r.j != 0 || n <= 0) return;
-    GdnCommitLayers a;
-    a.state = r.gdn + s.state_off;
-    a.h = s.h + (size_t) r.row0 * s.C; a.qkv = s.qkv + (size_t) r.row0 * s.C;
-    a.gate = s.gate + (size_t) r.row0 * s.h_v; a.beta = s.beta + (size_t) r.row0 * s.h_v;
-    a.state_stride = s.state_stride; a.h_stride = s.h_stride; a.gb_stride = s.gb_stride;
-    a.C = s.C; a.h_k = s.h_k; a.h_v = s.h_v; a.n_layers = s.n_layers;
-    commit_layers_body<kVerifyMaxT>(a, n, conv_blocks);
+__global__ void gdn_commit_lazy_none_kernel(CommitCtl* ctl) {
+    ctl->w[(size_t) kCtlWords * 10] = 0x40000000u;
+    __threadfence();
+}
+
+__global__ void gdn_commit_lazy_seg_none_kernel(CommitCtl* ctl) {
+    ctl->w[(size_t) kCtlWords * 11] = 0x40000000u;
+    __threadfence();
+}
+
+__global__ void gdn_commit_lazy_seg_begin_kernel(CommitCtl* ctl, int32_t* n_rows_dst, int n_rows) {
+    ctl->w[(size_t) kCtlWords * 11] = 0u;
+    if (n_rows_dst != nullptr) *n_rows_dst = n_rows;
+    __threadfence();
+}
+
+__global__ void __launch_bounds__(32 * RG) gdn_commit_lazy_seg_kernel(GdnCommitSeg s, const int32_t* n_rows_dev,
+                                                                      int conv_blocks, CommitCtl* ctl, int must_layers,
+                                                                      const uint32_t* stop, uint32_t stop_value,
+                                                                      GdnLazyPf pf) {
+    uint32_t* const claim = ctl->w + (size_t) kCtlWords * 11;
+    __shared__ int s_i;
+    __shared__ int s_segs[kVerifyMaxT];
+    __shared__ int s_ns;
+    const bool lead = threadIdx.x == 0 && threadIdx.y == 0;
+    if (lead) {
+        int ns = 0;
+        if (__ldcg(claim) < 0x40000000u) {
+            const int nr = min(n_rows_dev != nullptr ? __ldcg(n_rows_dev) : s.n_rows, kVerifyMaxT);
+            for (int ri = 0; ri < nr; ++ri) {
+                const SegRow r = s.rows[ri];
+                if (r.j == 0 && min(r.n_keep, kVerifyMaxT) > 0) s_segs[ns++] = ri;
+            }
+        }
+        s_ns = ns;
+    }
+    __syncthreads();
+    const int ns = s_ns;
+    if (ns > 0) {
+        const int per_state = s.h_v * (S / 32), per_layer_seg = per_state + conv_blocks;
+        const int per_layer_all = per_layer_seg * ns;
+        const int total = per_layer_all * s.n_layers;
+        const int must = per_layer_all * must_layers;
+        for (;;) {
+            if (lead) {
+                const int c = (int) min(__ldcg(claim), (uint32_t) total);
+                const bool more = c < must || (stop != nullptr && ld_acquire(stop) != stop_value);
+                s_i = c < total && more ? (int) atomicAdd(claim, 1u) : total;
+            }
+            __syncthreads();
+            const int i = s_i;
+            __syncthreads();
+            if (i >= total) break;
+            const int l = i / per_layer_all, rem = i - l * per_layer_all;
+            const int sg = rem / per_layer_seg, j = rem - sg * per_layer_seg;
+            const SegRow r = s.rows[s_segs[sg]];
+            const int n = min(r.n_keep, kVerifyMaxT);
+            if (j < per_state) {
+                GdnCommitLayers a;
+                a.state = r.gdn + s.state_off;
+                a.h = s.h + (size_t) r.row0 * s.C;
+                a.qkv = s.qkv + (size_t) r.row0 * s.C;
+                a.gate = s.gate + (size_t) r.row0 * s.h_v;
+                a.beta = s.beta + (size_t) r.row0 * s.h_v;
+                a.state_stride = s.state_stride;
+                a.h_stride = s.h_stride;
+                a.gb_stride = s.gb_stride;
+                a.C = s.C;
+                a.h_k = s.h_k;
+                a.h_v = s.h_v;
+                a.n_layers = s.n_layers;
+                CommitPre<kVerifyMaxT> p;
+                const int li = l * per_layer_seg + j;
+                commit_pre_load(a, per_layer_seg, n, li, p);
+                commit_pre_run(a, per_layer_seg, n, li, p);
+            } else {
+                gdn_conv_commit_n(r.gdn + s.state_off + (size_t) l * s.state_stride + (size_t) S * s.h_v * S,
+                                  s.qkv + (size_t) r.row0 * s.C + (size_t) l * s.h_stride, s.C, n,
+                                  (j - per_state) * 32 * RG + threadIdx.y * 32 + threadIdx.x);
+            }
+        }
+    }
+    // Prefetch next layer dense/hc/router weights into L2 while dm_combine4 waits for the CPU pool or peer GPU.
+    if (stop == nullptr || pf.n[0] == 0 || (int) blockIdx.x >= kLazyPfBlocks) return;
+    if (threadIdx.y == 0) {
+        bool off = false;
+        for (int i = threadIdx.x; i < pf.n_ids; i += 32) {
+            const int id = __ldcg(pf.ids + i);
+            off |= id >= 0 && id < pf.n_expert && __ldcg(pf.ptab + id) == 0ull;
+        }
+        off = __any_sync(0xffffffffu, off);
+        if (threadIdx.x == 0) s_i = off ? 1 : 0;
+    }
+    __syncthreads();
+    if (s_i == 0 || !lead) return;
+    auto tier_wait = [&](uint32_t w) { return w == (stop_value | 0x80000000u) || w == (stop_value | 0x40000000u); };
+    uint32_t v;
+    while (!tier_wait(v = ld_acquire(stop)) && v != stop_value) __nanosleep(256);
+    if (!tier_wait(v)) return;
+    uint64_t total_b = 0;
+    for (int r = 0; r < kLazyPfRanges; ++r) total_b += pf.n[r];
+    uint32_t acc = 0;
+    for (uint64_t o0 = (uint64_t) blockIdx.x * kLazyPfStep; o0 < total_b; o0 += (uint64_t) kLazyPfBlocks * kLazyPfStep) {
+        const uint64_t o1 = min(o0 + kLazyPfStep, total_b);
+        const char* last = nullptr;
+        for (uint64_t o = o0; o < o1;) {
+            int r = 0;
+            uint64_t ro = o;
+            while (r < kLazyPfRanges - 1 && ro >= pf.n[r]) { ro -= pf.n[r]; ++r; }
+            const uint64_t take = min(min(o1 - o, pf.n[r] - ro), (uint64_t) 32768);
+            if (take == 0) break;
+            const char* src = (const char*) pf.p[r] + ro;
+            if (take >= 16) {
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(src), "r"((unsigned) (take & ~15ull)) : "memory");
+                last = src + (take & ~15ull) - 16;
+            }
+            o += take;
+        }
+        if (last != nullptr) {
+            const uint4 w = __ldcg((const uint4*) last);
+            acc ^= w.x ^ w.y ^ w.z ^ w.w;
+        }
+        if (!tier_wait(ld_acquire(stop))) break;
+    }
+    if (acc == 0x9e3779b9u) ctl->w[(size_t) kCtlWords * 11 + 1] = acc;
+}
+
+// Flattened over all active segments in a single 1D grid so every SM runs at 3 blocks/SM regardless of segment count.
+__global__ void __launch_bounds__(32 * RG, 3) gdn_commit_layers_seg_kernel(GdnCommitSeg s, int conv_blocks) {
+    constexpr int kMaxSegs = 64;
+    __shared__ int seg_rows[kMaxSegs];
+    __shared__ int n_segs;
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        int ns = 0;
+        const int nr = min(s.n_rows, kMaxSegs);
+        for (int ri = 0; ri < nr; ++ri) {
+            const SegRow r = s.rows[ri];
+            if (r.j == 0 && min(r.n_keep, kVerifyMaxT) > 0) seg_rows[ns++] = ri;
+        }
+        n_segs = ns;
+    }
+    __syncthreads();
+    const int ns = n_segs;
+    if (ns <= 0) return;
+    const int per_state = s.h_v * (S / 32), per_layer = per_state + conv_blocks;
+    const int per_seg = per_layer * s.n_layers;
+    const int total = ns * per_seg;
+    const int step = gridDim.x;
+    auto make_seg = [&](int sg, GdnCommitLayers& a, int& n) {
+        const SegRow r = s.rows[seg_rows[sg]];
+        n = min(r.n_keep, kVerifyMaxT);
+        a.state = r.gdn + s.state_off;
+        a.h = s.h + (size_t) r.row0 * s.C;
+        a.qkv = s.qkv + (size_t) r.row0 * s.C;
+        a.gate = s.gate + (size_t) r.row0 * s.h_v;
+        a.beta = s.beta + (size_t) r.row0 * s.h_v;
+        a.state_stride = s.state_stride;
+        a.h_stride = s.h_stride;
+        a.gb_stride = s.gb_stride;
+        a.C = s.C;
+        a.h_k = s.h_k;
+        a.h_v = s.h_v;
+        a.n_layers = s.n_layers;
+    };
+    CommitPre<kVerifyMaxT> cur, nxt;
+    int idx = (int) blockIdx.x;
+    if (idx >= total) return;
+    int cur_sg = idx / per_seg, cur_i = idx - cur_sg * per_seg;
+    GdnCommitLayers cur_a, nxt_a;
+    int cur_n = 0, nxt_n = 0;
+    make_seg(cur_sg, cur_a, cur_n);
+    bool cur_state = (cur_i % per_layer) < per_state;
+    if (cur_state) commit_pre_load(cur_a, per_layer, cur_n, cur_i, cur);
+    for (; idx < total; idx += step) {
+        const int next_idx = idx + step;
+        int next_sg = 0, next_i = 0;
+        bool next_state = false;
+        if (next_idx < total) {
+            next_sg = next_idx / per_seg;
+            next_i = next_idx - next_sg * per_seg;
+            if (next_sg == cur_sg) {
+                nxt_a = cur_a;
+                nxt_n = cur_n;
+            } else {
+                make_seg(next_sg, nxt_a, nxt_n);
+            }
+            next_state = (next_i % per_layer) < per_state;
+            if (next_state) commit_pre_load(nxt_a, per_layer, nxt_n, next_i, nxt);
+        }
+        if (cur_state) {
+            commit_pre_run(cur_a, per_layer, cur_n, cur_i, cur);
+        } else {
+            const int l = cur_i / per_layer, j = cur_i - l * per_layer;
+            gdn_conv_commit_n(cur_a.state + (size_t) l * cur_a.state_stride + (size_t) S * cur_a.h_v * S,
+                              cur_a.qkv + (size_t) l * cur_a.h_stride, cur_a.C, cur_n,
+                              (j - per_state) * 32 * RG + threadIdx.y * 32 + threadIdx.x);
+        }
+        cur_sg = next_sg;
+        cur_i = next_i;
+        cur_a = nxt_a;
+        cur_n = nxt_n;
+        cur_state = next_state;
+        if (next_state) cur = nxt;
+    }
 }
 
 // n tokens from `state` (written back when `write`)
@@ -793,30 +985,36 @@ namespace {
 struct CondHandles { unsigned long long h[16]; };
 __global__ void mtp_draft_cond_kernel(CondHandles hs, int n, const float* __restrict__ probs,
                                       const int32_t* __restrict__ row, const int32_t* __restrict__ th_bits,
-                                      const float* hist, int j) {
-    const float p = probs[*row];
-    // the same products, in the same order, as draft_keep on the host
-    float c = 1.0f;
-    for (int i = 0; i < j; ++i) c = c * basalt::core::draft_cum_acc(((const volatile float*) hist)[i]);
-    c = c * basalt::core::draft_cum_acc(p);
-    const bool keep = c >= __int_as_float(*th_bits);
+                                      const float* hist, int j, const int32_t* __restrict__ max_steps_dev) {
+    const int cap = max_steps_dev != nullptr ? *max_steps_dev : 0;
+    const bool within_cap = cap <= 0 || j + 1 < cap;
+    bool keep = false;
+    if (within_cap) {
+        const float p = probs[*row];
+        // the same products, in the same order, as draft_keep on the host
+        float c = 1.0f;
+        for (int i = 0; i < j; ++i) c = c * basalt::core::draft_cum_acc(((const volatile float*) hist)[i]);
+        c = c * basalt::core::draft_cum_acc(p);
+        keep = c >= __int_as_float(*th_bits);
+    }
     cudaGraphSetConditional((cudaGraphConditionalHandle) hs.h[0], keep ? 1u : 0u);
     for (int k = 1; k < n; ++k) cudaGraphSetConditional((cudaGraphConditionalHandle) hs.h[k], 0u);
 }
 }  // namespace
 
 bool mtp_draft_cond(const unsigned long long* h, int n, const float* probs, const int32_t* row,
-                    const int32_t* th_bits, void* stream, const float* hist, int j) {
+                    const int32_t* th_bits, void* stream, const float* hist, int j,
+                    const int32_t* max_steps_dev) {
     if (n < 1 || n > 16) { basalt::log::error("basalt", "mtp_draft_cond: n out of range"); std::exit(1); }
     CondHandles hs{};
     for (int k = 0; k < n; ++k) hs.h[k] = h[k];
-    mtp_draft_cond_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(hs, n, probs, row, th_bits, hist, j);
+    mtp_draft_cond_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(hs, n, probs, row, th_bits, hist, j, max_steps_dev);
     check("mtp_draft_cond");
     return true;
 }
 #else
 bool mtp_draft_cond(const unsigned long long*, int, const float*, const int32_t*, const int32_t*, void*, const float*,
-                    int) { return false; }
+                    int, const int32_t*) { return false; }
 #endif
 
 namespace {
@@ -863,7 +1061,7 @@ struct StepEndCond { unsigned long long h[16]; };
 __global__ void mtp_step_end_kernel(const int32_t* __restrict__ ids, const int32_t* __restrict__ row_dev,
                                     int32_t* __restrict__ tok_dst, int32_t* out, int j, const float* probs, float* out_p,
                                     StepEndCond hs, int n, const int32_t* __restrict__ th_bits,
-                                    const float* hist) {
+                                    const float* hist, const int32_t* __restrict__ max_steps_dev) {
     const int row = *row_dev;
     const int32_t tok = ids[row];
     const float p = probs[row];
@@ -873,11 +1071,15 @@ __global__ void mtp_step_end_kernel(const int32_t* __restrict__ ids, const int32
     ((volatile int32_t*) out)[j] = tok;
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 12040
     if (n <= 0) return;
-    // the same products, in the same order, as draft_keep on the host
-    float c = 1.0f;
-    for (int i = 0; i < j; ++i) c = c * basalt::core::draft_cum_acc(((const volatile float*) hist)[i]);
-    c = c * basalt::core::draft_cum_acc(p);
-    const bool keep = c >= __int_as_float(*th_bits);
+    const int cap = max_steps_dev != nullptr ? *max_steps_dev : 0;
+    bool keep = false;
+    if (cap <= 0 || j + 1 < cap) {
+        // the same products, in the same order, as draft_keep on the host
+        float c = 1.0f;
+        for (int i = 0; i < j; ++i) c = c * basalt::core::draft_cum_acc(((const volatile float*) hist)[i]);
+        c = c * basalt::core::draft_cum_acc(p);
+        keep = c >= __int_as_float(*th_bits);
+    }
     cudaGraphSetConditional((cudaGraphConditionalHandle) hs.h[0], keep ? 1u : 0u);
     for (int k = 1; k < n; ++k) cudaGraphSetConditional((cudaGraphConditionalHandle) hs.h[k], 0u);
 #endif
@@ -886,7 +1088,7 @@ __global__ void mtp_step_end_kernel(const int32_t* __restrict__ ids, const int32
 
 bool mtp_step_end(const int32_t* ids, const int32_t* row_dev, int32_t* tok_dst, int32_t* out, int j, const float* probs,
                   float* out_p, const unsigned long long* h, int n, const int32_t* th_bits,
-                  const float* hist, void* stream) {
+                  const float* hist, void* stream, const int32_t* max_steps_dev) {
 #if !(defined(CUDART_VERSION) && CUDART_VERSION >= 12040)
     if (n > 0) return false;
 #endif
@@ -894,7 +1096,7 @@ bool mtp_step_end(const int32_t* ids, const int32_t* row_dev, int32_t* tok_dst, 
     StepEndCond hs{};
     for (int k = 0; k < n; ++k) hs.h[k] = h[k];
     mtp_step_end_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(ids, row_dev, tok_dst, out, j, probs, out_p, hs, n, th_bits,
-                                                            hist);
+                                                            hist, max_steps_dev);
     check("mtp_step_end");
     return true;
 }
@@ -960,8 +1162,20 @@ void gdn_step_norm_seg(const SegRow* rows, size_t state_off, const float* h, int
 void gdn_commit_layers_seg(const GdnCommitSeg& a, void* stream, int blocks) {
     if (a.n_layers <= 0 || a.n_rows <= 0) return;
     const int conv_blocks = (a.C + 32 * RG - 1) / (32 * RG);
-    gdn_commit_layers_seg_kernel<<<dim3((unsigned) (blocks > 0 ? blocks : 1), (unsigned) a.n_rows), dim3(32, RG), 0,
-                                   (cudaStream_t) stream>>>(a, conv_blocks);
+    int dev = 0, sms = 0;
+    static int cached_sms[16] = {};
+    if (cudaGetDevice(&dev) == cudaSuccess && dev >= 0 && dev < 16) {
+        if (cached_sms[dev] == 0) {
+            if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess && sms > 0)
+                cached_sms[dev] = sms;
+            else
+                cached_sms[dev] = -1;
+        }
+        sms = cached_sms[dev] > 0 ? cached_sms[dev] : 0;
+    }
+    const int min_blocks = (blocks > 0 ? blocks : 32) * a.n_rows;
+    const int grid_blocks = std::max(min_blocks, sms > 0 ? sms * 3 : min_blocks);
+    gdn_commit_layers_seg_kernel<<<(unsigned) grid_blocks, dim3(32, RG), 0, (cudaStream_t) stream>>>(a, conv_blocks);
     check("gdn_commit_layers_seg");
 }
 
@@ -998,7 +1212,32 @@ void gdn_commit_lazy(const GdnCommitLayers& a, CommitCtl* ctl, int must_layers, 
 
 bool gdn_commit_lazy_none(CommitCtl* ctl) {
     const uint32_t none = 0x40000000u;
-    return cudaMemcpy(ctl->w + (size_t) kCtlWords * 10, &none, 4, cudaMemcpyHostToDevice) == cudaSuccess;
+    return cudaMemcpy(ctl->w + (size_t) kCtlWords * 10, &none, 4, cudaMemcpyHostToDevice) == cudaSuccess &&
+           cudaMemcpy(ctl->w + (size_t) kCtlWords * 11, &none, 4, cudaMemcpyHostToDevice) == cudaSuccess;
+}
+
+void gdn_commit_lazy_none_async(CommitCtl* ctl, void* stream) {
+    gdn_commit_lazy_none_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(ctl);
+    check("gdn_commit_lazy_none_async");
+}
+
+void gdn_commit_lazy_seg_none_async(CommitCtl* ctl, void* stream) {
+    gdn_commit_lazy_seg_none_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(ctl);
+    check("gdn_commit_lazy_seg_none_async");
+}
+
+void gdn_commit_lazy_seg_begin(CommitCtl* ctl, int32_t* n_rows_dst, int n_rows, void* stream) {
+    gdn_commit_lazy_seg_begin_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(ctl, n_rows_dst, n_rows);
+    check("gdn_commit_lazy_seg_begin");
+}
+
+void gdn_commit_lazy_seg(const GdnCommitSeg& a, const int32_t* n_rows_dev, CommitCtl* ctl, int must_layers,
+                         const uint32_t* stop, uint32_t stop_value, void* stream, int blocks, const GdnLazyPf* pf) {
+    if (a.n_layers <= 0) return;
+    const int conv_blocks = (a.C + 32 * RG - 1) / (32 * RG);
+    gdn_commit_lazy_seg_kernel<<<(unsigned) (blocks > 0 ? blocks : 1), dim3(32, RG), 0, (cudaStream_t) stream>>>(
+        a, n_rows_dev, conv_blocks, ctl, must_layers, stop, stop_value, pf != nullptr ? *pf : GdnLazyPf{});
+    check("gdn_commit_lazy_seg");
 }
 
 

@@ -31,7 +31,7 @@ void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv
 /// then the newest epoch, the last epoch a finisher finished and the lazy layers' claims.  Zeroed once (then
 /// gdn_commit_lazy_none); a set and the lazy claims are reset by the begin kernel of the epoch that uses them.
 struct CommitCtl {
-    uint32_t w[32 * 11];
+    uint32_t w[32 * 12];
 };
 /// The commit epoch's start: reads the epoch (> 0) from `epoch` (a device alias of mapped memory), resets that epoch's
 /// counter set, publishes `started` and writes the epoch to `begun` (a device alias of mapped memory the host polls).
@@ -63,6 +63,12 @@ void gdn_commit_lazy(const GdnCommitLayers& a, CommitCtl* ctl, int must_layers, 
                      uint32_t stop_value, void* stream, int blocks, const GdnLazyPf* pf = nullptr);
 /// The lazy counter of a new CommitCtl: nothing owed until the first begin kernel.
 bool gdn_commit_lazy_none(CommitCtl* ctl);
+/// Marks the solo lazy claim counter exhausted asynchronously on `stream` without host sync.
+void gdn_commit_lazy_none_async(CommitCtl* ctl, void* stream);
+/// Marks the segmented batch lazy claim counter exhausted asynchronously on `stream` without host sync.
+void gdn_commit_lazy_seg_none_async(CommitCtl* ctl, void* stream);
+/// Resets the batch lazy claim counter to 0 and records the segmented batch row count for gdn_commit_lazy_seg.
+void gdn_commit_lazy_seg_begin(CommitCtl* ctl, int32_t* n_rows_dst, int n_rows, void* stream);
 /// gdn_conv_l2_multi over a segmented window: every row's conv from its own segment's history (hist_off floats past
 /// `gdn`: the layer's conv history), all n_rows rows in one launch; bitwise the per-segment calls.
 void gdn_conv_l2_seg(const SegRow* rows, size_t hist_off, const float* qkv, const float* conv_w, float* h, int channels,
@@ -82,6 +88,11 @@ struct GdnCommitSeg {
     int C = 0, h_k = 0, h_v = 0, n_layers = 0, n_rows = 0;
 };
 void gdn_commit_layers_seg(const GdnCommitSeg& a, void* stream, int blocks = 32);
+/// Segmented batch counterpart of gdn_commit_lazy: drains layer-major lazy GDN commits across all active segments
+/// in `a.rows[0 .. *n_rows_dev)`, then runs the optional next-layer L2 weight prefetch while waiting on `stop`.
+void gdn_commit_lazy_seg(const GdnCommitSeg& a, const int32_t* n_rows_dev, CommitCtl* ctl, int must_layers,
+                         const uint32_t* stop, uint32_t stop_value, void* stream, int blocks,
+                         const GdnLazyPf* pf = nullptr);
 /// The PLE history of each row's slot as data: `slots[slot]` is that slot's history (`n` floats).  Gather: work row t =
 /// the slot's history; scatter: the slot's history = row (row0 + n_keep - 1) of `work` for each segment's first row
 /// (n_keep <= 0 leaves it).
@@ -165,7 +176,8 @@ void mtp_take_row(float* R, int64_t R_stride, float* inj, int64_t inj_stride, fl
 /// threshold whose float bits are at *th_bits, and h[1..n) <- 0 (n <= 8).
 /// False (nothing launched) when the build has no conditional graph nodes.
 bool mtp_draft_cond(const unsigned long long* h, int n, const float* probs, const int32_t* row,
-                    const int32_t* th_bits, void* stream, const float* hist, int j);
+                    const int32_t* th_bits, void* stream, const float* hist, int j,
+                    const int32_t* max_steps_dev = nullptr);
 /// The draft round's staging in one launch: each of up to 6 int segments (dst, host-mapped src, count) by a block of its
 /// own, and `n_f` floats (a multiple of 4, 16-byte aligned) from `f_src` to `f_dst` by the other blocks; the same copies
 /// as copy_i32_from_mapped and copy_from_mapped.
@@ -176,7 +188,7 @@ void mtp_stage(const MtpStageSeg* segs, int n_segs, float* f_dst, const float* f
 /// (nothing launched) when n > 0 and the build has no conditional graph nodes.
 bool mtp_step_end(const int32_t* ids, const int32_t* row_dev, int32_t* tok_dst, int32_t* out, int j, const float* probs,
                   float* out_p, const unsigned long long* h, int n, const int32_t* th_bits,
-                  const float* hist, void* stream);
+                  const float* hist, void* stream, const int32_t* max_steps_dev = nullptr);
 /// Dense-attention step records for `n` cells: [cell, cell+1, (cell+1)/4, cell+1] from cells[i] (device memory).
 void dense_steps(const int32_t* cells, int n, int32_t* steps, void* stream);
 /// A sliding attention window: for `n` step records (kStepCount ints each, n_kv at [1]) the selection becomes the

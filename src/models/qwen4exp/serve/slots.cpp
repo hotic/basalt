@@ -33,6 +33,7 @@ void QfnRuntime::make_view(basalt::core::SessionState& v, int b) {
 
 // the session a request just left behind (its prompt) -> slot b's sessions, on every stage
 bool QfnRuntime::copy_to_slot(int b, const std::vector<int32_t>& ids, std::string& e) {
+    if (!ver.wait_commit(e)) return false;
     const int64_t upto = (int64_t) ids.size();
     for (size_t k = 0; k < bslot_ss.size(); ++k) {
         basalt::core::SessionState& from = k == 0 ? *rsp : stages[k - 1]->ss;
@@ -63,6 +64,7 @@ bool QfnRuntime::copy_to_slot(int b, const std::vector<int32_t>& ids, std::strin
 }
 
 bool QfnRuntime::hold_slot(int b, const ConvCheckpoint* at, std::string& e) {
+    if (!ver.wait_commit(e)) return false;
     slot_held = SlotHeld{};
     const int64_t upto = at != nullptr ? (int64_t) at->ids.size() : (int64_t) bs[(size_t) b].ids.size();
     slot_held.ck.resize(bslot_ss.size());
@@ -93,6 +95,7 @@ bool QfnRuntime::hold_slot(int b, const ConvCheckpoint* at, std::string& e) {
 // conversation an idle slot holds reads on from there.  Every stage, the same calls.
 // `at`: one of the slot's checkpoints - only the K/V up to it is copied and its state restored instead
 bool QfnRuntime::copy_from_slot(int b, const ConvCheckpoint* at, std::string& e) {
+    if (!ver.wait_commit(e)) return false;
     const int64_t upto = at != nullptr ? (int64_t) at->ids.size() : (int64_t) bs[(size_t) b].ids.size();
     if (at != nullptr && at->stage_parts.size() != stages.size()) { e = "a checkpoint without its stage parts"; return false; }
     const bool held = slot_held.b == b;
@@ -143,6 +146,8 @@ void QfnRuntime::solo_draft_back(bool keep) {
 // indexer tails, dead rows, block positions, K, V, scales, pooled rows), for comparing a slot's state window by
 // window against another run of the same request
 bool QfnRuntime::slot_digest(int b, int64_t upto, uint64_t* part) {
+    std::string we;
+    if (!ver.wait_commit(we)) return false;
     for (int i = 0; i < 10; ++i) part[i] = 1469598103934665603ull;
     auto mix = [&](int i, const uint8_t* p, size_t n) {
         uint64_t h = part[i];

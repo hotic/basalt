@@ -171,11 +171,20 @@ bool Verifier::run_slot_segs(const int* rows, const int* lens, int S, const int3
             }
         }
     }
-    order_after_commit();
+    order_after_commit(false, true);
+    if (wait_ev_ != nullptr) {
+        const cudaError_t we = cudaStreamWaitEvent(cs_, wait_ev_, 0);
+        wait_ev_ = nullptr;
+        if (we != cudaSuccess) { err = std::string("verify: batch wait event: ") + cudaGetErrorString(we); return false; }
+    }
+    if (batch_lazy_on() && !batch_lz_pending_) {
+        gdn_commit_lazy_seg_none_async(commit_ctl_, cs_);
+    }
     set_head_keep(0);   // the slots sample with their own parameters: every row exact
     if (ar_on() && h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
     const cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(R, 0)], cs_);
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
+    batch_lz_pending_ = false;   // exec_bm_ drains all 35 lazy GDN layers before returning
     (void) cudaStreamQuery(cs_);
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
@@ -287,7 +296,12 @@ bool Verifier::run_slot_segs(const int* rows, const int* lens, int S, const int3
 bool Verifier::commit_slots(std::string& err) { return commit_slots(nullptr, err); }
 
 bool Verifier::commit_slots(const int* n_keep, std::string& err) {
-    return commit_slots_begin(n_keep, err) && commit_slots_end(err);
+    if (!commit_slots_begin(n_keep, err)) return false;
+    {
+        const OnDevice on_device(device_);
+        apply_batch_lazy();
+    }
+    return commit_slots_end(err);
 }
 
 bool Verifier::commit_slots_begin(const int* n_keep, std::string& err) {
@@ -311,6 +325,8 @@ bool Verifier::commit_slots_begin(const int* n_keep, std::string& err) {
     order_after_commit();
     const cudaError_t le = cudaGraphLaunch(commit_bm_[last_t_], cs_);
     if (le != cudaSuccess) { err = std::string("verify: batch commit launch: ") + cudaGetErrorString(le); return false; }
+    const auto it_lz = commit_bm_lazy_.find(last_t_);
+    if (it_lz != commit_bm_lazy_.end() && it_lz->second) batch_lz_pending_ = true;
     // (the PLE history the commit leaves is known from the tokens: it advances now, the graph runs beside the caller)
     if (ple_stage())
         for (int sg = 0, r0 = 0; sg < last_nseg_; r0 += last_seg_len_[sg], ++sg) {
@@ -365,11 +381,14 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
     gs_split_ = false;
     if (!stage_batch(rows, nullptr, S, base, tokens, pos, err)) return false;
     order_after_commit();
+    if (batch_lazy_on() && !batch_lz_pending_) gdn_commit_lazy_seg_none_async(commit_ctl_, cs_);
     set_head_keep(0);   // the slots sample with their own parameters: every row exact
     if (ar_on() && h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
     cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(S, base)], cs_);
     if (le == cudaSuccess) le = cudaGraphLaunch(commit_bm_[S], cs_);   // right behind it: every row is kept
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
+    const auto it_lz = commit_bm_lazy_.find(S);
+    if (it_lz != commit_bm_lazy_.end() && it_lz->second) batch_lz_pending_ = true;
     (void) cudaStreamQuery(cs_);
     if (ar_on()) ar_handoff();
     if (ple_stage())   // the host's side of the commit (the hash's last two tokens)

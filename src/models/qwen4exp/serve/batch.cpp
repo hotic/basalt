@@ -186,38 +186,33 @@ bool QfnRuntime::batch_step() {
     drive.d.layers = 0;
     drive.d.experts = 0;
     drive.d.failed = false;
-    if (!ov_active) apply_pending(false);
-    if (batch_adapt && !ov_active) {
-        // the tier follows what all the slots' rows route: a round every --adapt-every windows.  Its steps
-        // are taken once their copies are done; the copies out of the RAM tier (which may read the experts
-        // file) are queued from a worker thread beside the windows, so no window waits for one.
+    auto run_batch_adapt_step = [&]() -> bool {
+        const basalt::core::OnDevice on_ba_dev(ver.device());
         const Clock::time_point ta = Clock::now();
+        apply_pending(false);
         bool ok = true, acted = false;
         ++ba_win;
-        if (ba_job && ba_thr.finished()) { ba_thr.join(); ba_job = false; }
-        if (!ba_job) {
-            if (xq_stage != 0) {
-                if (cudaEventQuery(adapt_ev) == cudaSuccess) {
-                    const int was = xq_stage;
-                    ok = xq_advance(true);
-                    if (ok && was == 1 && xq_stage == 2) {
-                        ba_thr.run([&] { ver.flush_post_launch(); });
-                        ba_job = true;
-                    }
-                    acted = true;
-                }
-            } else if (ba_win % o.adapt_every == 0) {
-                const int64_t np0 = xq_noplace;
-                ok = xq_round();
-                ba_swaps += (int64_t) xq.size();
-                ba_noplace += xq_noplace - np0;
-                ++ba_rounds;
+        const int64_t ba_period = o.adapt_every_given
+            ? (int64_t) o.adapt_every
+            : (int64_t) o.adapt_every * (S <= 1 ? 1LL : (int64_t) S * 2LL);
+        if (xq_stage != 0) {
+            if (cudaEventQuery(adapt_ev) == cudaSuccess) {
+                const int was = xq_stage;
+                ok = xq_advance(true);
+                if (ok && was == 1 && xq_stage == 2) ver.flush_post_launch();
                 acted = true;
             }
+        } else if (++ba_since_adapt >= ba_period) {
+            ba_since_adapt = 0;
+            const int64_t np0 = xq_noplace;
+            ok = xq_round();
+            ba_swaps += (int64_t) xq.size();
+            ba_noplace += xq_noplace - np0;
+            ++ba_rounds;
+            acted = true;
         }
         std::string perr;
         if (ok && acted && !ver.dm_presync(perr)) basalt::log::warn("basalt serve", "%s", perr.c_str());
-        if (!ok) { std::printf("ERR an adaptive refill failed\n"); return false; }
         ba_ms += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
         if (ba_win % 2000 == 0 && ba_win > 0) {   // the swap rate and the hit rate over the last 2000 windows
             const int64_t h = drive.d.cache_hits, m = drive.d.multi_misses;
@@ -226,6 +221,18 @@ bool QfnRuntime::batch_step() {
                          (long long) (ba_rounds - ba_rounds_l), (double) (h - ba_h_l) / (2000.0 * g.n_layers),
                          (double) (m - ba_m_l) / (2000.0 * g.n_layers));
             ba_swaps_l = ba_swaps; ba_rounds_l = ba_rounds; ba_h_l = h; ba_m_l = m;
+        }
+        return ok;
+    };
+    // When speculative drafting is disabled or bdigest prevents overlap, run adapt synchronously here;
+    // otherwise overlap it on ba_thr alongside commit_slots_begin + MTP draft at the end of the window.
+    const bool adapt_overlap = batch_adapt && !ov_active && real && !bdigest;
+    if (!ov_active && !adapt_overlap) {
+        if (ba_job) { ba_thr.join(); ba_job = false; }
+        if (batch_adapt) {
+            if (!run_batch_adapt_step()) { std::printf("ERR an adaptive refill failed\n"); return false; }
+        } else {
+            apply_pending(false);
         }
     }
     if (bt_windows == 0) {
@@ -371,54 +378,114 @@ bool QfnRuntime::batch_step() {
     stats_tick();   // also when a prompt read runs these windows beside it, outside the command loop
     const Clock::time_point w3 = Clock::now();
     bt_emit += msd(w2, w3);
+    bool ba_async_ok = true;
+    bool ba_async_launched = false;
+    if (adapt_overlap && batch_on()) {
+        if (ba_job) { ba_thr.join(); ba_job = false; }
+        ba_thr.run([&] { ba_async_ok = run_batch_adapt_step(); });
+        ba_job = true;
+        ba_async_launched = true;
+    }
+    auto join_ba_async = [&]() -> bool {
+        if (!ba_async_launched) return true;
+        ba_thr.join();
+        ba_job = false;
+        ba_async_launched = false;
+        if (!ba_async_ok) {
+            std::printf("ERR an adaptive refill failed\n");
+            return false;
+        }
+        return true;
+    };
     if (real) {
         // the next windows' drafts, one slot at a time on the slot's own draft K/V.  The rows beyond one per
         // slot go to the slots most likely to use them; the others only advance their draft K/V.
         int cont[MR], nc = 0;
         for (int sg = 0; sg < S; ++sg) if (fin_of[sg] == nullptr) cont[nc++] = sg;
-        int nfull = std::min(nc, MR - nc);
+        int nfull = std::min(nc, MB - nc);
         sort_small(cont, nc, [&](int x1, int x2) {
             const BSlot& s1 = bs[(size_t) rows[x1]];
             const BSlot& s2 = bs[(size_t) rows[x2]];
             return s1.acc + 0.05 * (double) s1.since_draft > s2.acc + 0.05 * (double) s2.since_draft;
         });
         const float* Rw = mtp.keep_rows(ver.final_R_all(), R, err);
-        if (Rw == nullptr) { std::printf("ERR %s\n", err.c_str()); return false; }
+        if (Rw == nullptr) { (void) join_ba_async(); std::printf("ERR %s\n", err.c_str()); return false; }
         const int64_t HCN = (int64_t) g.hc * g.n_embd;
-        for (int ci = 0; ci < nc; ++ci) {
+        // Advance deferred slots first (async D2D only).
+        for (int ci = nfull; ci < nc; ++ci) {
+            const int sg = cont[ci];
+            const int b = rows[sg];
+            BSlot& sl = bs[(size_t) b];
+            mtp.set_ple_session(bslot_ss[0][(size_t) b].get());
+            sl.n_dr = 0;
+            ++sl.since_draft;
+            if (!mtp.defer_rows(b, Rw + (size_t) r0s[sg] * HCN, outb + r0s[sg], n_keep[sg], p0s[sg], err)) {
+                mtp.set_ple_session(rsp);
+                (void) join_ba_async();
+                std::printf("ERR %s\n", err.c_str());
+                return false;
+            }
+        }
+        // Draft from lowest-priority to highest-priority slot with a dynamic cap bounded by MB - nc:
+        // avoids wasting autoregressive MTP steps beyond what the next window can hold, while automatically
+        // rolling any unused budget from a low-confidence slot up to the highest-acceptance slot.
+        mtp.set_host_th(-1.0f);   // follow each slot's cum_th; never inherit stale solo host_th_
+        int rem_budget = MB - nc;
+        for (int ci = nfull - 1; ci >= 0; --ci) {
             const int sg = cont[ci];
             const int b = rows[sg];
             BSlot& sl = bs[(size_t) b];
             const int Tw = lens[sg];
             const int a = n_keep[sg] - 1;
+            const int cap = nc > 1 ? std::max(1, rem_budget / (ci + 1)) : 0;
             mtp.set_ple_session(bslot_ss[0][(size_t) b].get());
+            mtp.set_cum_th(sl.cum.th());
+            mtp.set_call_max_drafts(cap);
             sl.n_dr = 0;
-            if (ci < nfull) {
-                mtp.set_cum_th(sl.cum.th());
-                int nd = 0;
-                if (!mtp.draft_seq(b, Rw + (size_t) r0s[sg] * HCN, Tw, outb + r0s[sg], p0s[sg], a, sl.dr, err, sl.dprob,
-                                   &nd)) {
-                    std::printf("ERR %s\n", err.c_str());
-                    return false;
-                }
-                sl.n_dr = nd;
-                sl.since_draft = 0;
-            } else {
-                ++sl.since_draft;
-                if (!mtp.defer_rows(b, Rw + (size_t) r0s[sg] * HCN, outb + r0s[sg], n_keep[sg], p0s[sg], err)) {
-                    std::printf("ERR %s\n", err.c_str());
-                    return false;
-                }
+            int nd = 0;
+            if (!mtp.draft_seq(b, Rw + (size_t) r0s[sg] * HCN, Tw, outb + r0s[sg], p0s[sg], a, sl.dr, err, sl.dprob,
+                               &nd)) {
+                mtp.set_call_max_drafts(0);
+                mtp.set_ple_session(rsp);
+                (void) join_ba_async();
+                std::printf("ERR %s\n", err.c_str());
+                return false;
+            }
+            sl.n_dr = nd;
+            sl.since_draft = 0;
+            if (nc > 1) {
+                int kept = 0;
+                while (kept < nd && basalt::core::draft_keep(sl.dprob, kept, sl.cum.th())) ++kept;
+                rem_budget = std::max(ci, rem_budget - kept);
             }
         }
+        mtp.set_call_max_drafts(0);
         mtp.set_ple_session(rsp);
-        if (!mtp.idle(err)) { std::printf("ERR %s\n", err.c_str()); return false; }   // (the kept rows are copied)
+        if (batch_on()) {
+            const cudaEvent_t ev = mtp.done_event();
+            if (ev != nullptr) {
+                ver.set_wait_event(ev);
+            } else if (!mtp.idle(err)) {
+                (void) join_ba_async();
+                std::printf("ERR %s\n", err.c_str());
+                return false;
+            }
+        } else {
+            if (!mtp.idle(err)) { (void) join_ba_async(); std::printf("ERR %s\n", err.c_str()); return false; }
+        }
         bt_draft += msd(w3, Clock::now());
         bt_draft_last = msd(w3, Clock::now());
     }
+    if (!join_ba_async()) return false;
     if (overlap) {
         const Clock::time_point c0 = Clock::now();
         if (!ver.commit_slots_end(err)) {
+            std::printf("ERR %s\n", err.c_str());
+            return false;
+        }
+        bool any_fin = !batch_on();
+        for (int sg = 0; !any_fin && sg < S; ++sg) any_fin = fin_of[sg] != nullptr;
+        if (any_fin && !ver.wait_commit(err)) {
             std::printf("ERR %s\n", err.c_str());
             return false;
         }

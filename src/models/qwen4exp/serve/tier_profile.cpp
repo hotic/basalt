@@ -41,6 +41,7 @@ bool QfnRuntime::probe_adapt(const std::string& cmd, std::string& e) {
         return false;
     }
     int every = o.adapt_every, swaps_n = o.adapt_swaps;
+    bool every_set = false;
     float decay = fast_decay;
     std::string pfile;
     std::istringstream kvs(cmd.substr(11));
@@ -48,7 +49,7 @@ bool QfnRuntime::probe_adapt(const std::string& cmd, std::string& e) {
         const size_t eq = kv.find('=');
         const std::string key = eq == std::string::npos ? kv : kv.substr(0, eq);
         const std::string val = eq == std::string::npos ? std::string() : kv.substr(eq + 1);
-        if (key == "every" && !val.empty()) every = std::atoi(val.c_str());
+        if (key == "every" && !val.empty()) { every = std::atoi(val.c_str()); every_set = true; }
         else if (key == "swaps" && !val.empty()) swaps_n = std::atoi(val.c_str());
         else if (key == "decay" && !val.empty()) decay = (float) std::atof(val.c_str());
         else if (key == "profile" && !val.empty()) pfile = val;
@@ -273,6 +274,7 @@ bool QfnRuntime::probe_adapt(const std::string& cmd, std::string& e) {
     (void) conversations->take_reuse(rsp);
     while (conversations->size() > 0) (void) conversations->take(0);
     o.adapt_every = every;
+    if (every_set) o.adapt_every_given = true;
     o.adapt_swaps = swaps_n;
     o.adapt_decay = decay;
     o.adapt_decay_set = true;

@@ -121,14 +121,19 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
     dev.stamp(5);
     if (next_ == nullptr && dev.on) { dev.next_window(); dev.record(DecodeEvents::kVerifyPre, cs_); }
     if (ar_on() && h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
+    // Unconditionally drain any pending batch lazy GDN layers on cs_ before solo reuses shared replay buffers.
+    if (batch_lz_pending_) apply_batch_lazy();
     // an async commit still running: the window's first node waits for it once the commit's begin kernel has run (the
     // device then knows the epoch); if that does not happen within moments, the window follows the commit on the device
     if (!finisher_on() || (commit_pending_ && !commit_begun()))
         order_after_commit(true);
+    if (lazy_on() && !lz_pending_)
+        basalt::kernels::gdn_commit_lazy_none_async(commit_ctl_, cs_);
     if (after != nullptr) cudaStreamWaitEvent(cs_, after, 0);   // behind another verifier's work on the same state
     if (wait_ev_ != nullptr) {
-        cudaStreamWaitEvent(cs_, wait_ev_, 0);
+        const cudaError_t we = cudaStreamWaitEvent(cs_, wait_ev_, 0);
         wait_ev_ = nullptr;
+        if (we != cudaSuccess) { err = std::string("verify: wait event: ") + cudaGetErrorString(we); return false; }
     }
     *(volatile int32_t*) h_head_from_ = head_sampling_ ? std::clamp(head_from_, 0, T) : T;
     head_from_ = 0;

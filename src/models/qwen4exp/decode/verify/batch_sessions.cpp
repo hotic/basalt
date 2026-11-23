@@ -79,7 +79,9 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
     }
     const uint64_t a = ((uint64_t) S * CB * 4 + 255) & ~255ull;
     const uint64_t b = (a + (uint64_t) S * std::max<int64_t>(nQ, 1) * TS * 4 + 255) & ~255ull;
-    const uint64_t b2 = (b + (uint64_t) max_t_ * sizeof(basalt::kernels::SegRow) + 255) & ~255ull;
+    const uint64_t b1c = (b + (uint64_t) max_t_ * sizeof(basalt::kernels::SegRow) + 255) & ~255ull;
+    const uint64_t b1n = (b1c + (uint64_t) max_t_ * sizeof(basalt::kernels::SegRow) + 255) & ~255ull;
+    const uint64_t b2 = (b1n + 256) & ~255ull;
     const uint64_t b3 = (b2 + (uint64_t) (basalt::kernels::kQsaSegMaxRows + 8) * sizeof(QsaSeg) + 255) & ~255ull;
     const uint64_t HSb = (uint64_t) NG_HIST * NG_HC_DIM * sizeof(float);
     const uint64_t b4 = (b3 + (uint64_t) S * sizeof(float*) + 255) & ~255ull;
@@ -92,6 +94,9 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
     commitb_ = (int32_t*) d;
     tail_snap_b_ = (float*) ((uint8_t*) d + a);
     segb_ = (basalt::kernels::SegRow*) ((uint8_t*) d + b);
+    segb_commit_ = (basalt::kernels::SegRow*) ((uint8_t*) d + b1c);
+    d_seg_nrows_ = (int32_t*) ((uint8_t*) d + b1n);
+    cudaMemset(d_seg_nrows_, 0, sizeof(int32_t));
     d_qrows_ = (QsaSeg*) ((uint8_t*) d + b2);
     d_qsegs_ = d_qrows_ + basalt::kernels::kQsaSegMaxRows;
     d_ple_slots_ = (float**) ((uint8_t*) d + b3);
