@@ -87,6 +87,7 @@ struct PsPart {
     uint64_t row_bytes = 0;             ///< one token's hand-off rows
     int64_t draft_rows = 0;             ///< rows of the split's chunks before the last that the draft layer reads back
     double host_gbps = 0;               ///< host->device bandwidth with every card copying at once (probed); 0: no limit
+    double ple_us_token = -1.0;         ///< first-chunk PLE wait per token in us (< 0: default kPsPleUsToken)
 };
 
 /// The most stages a split is priced with, the main card's included.
@@ -107,6 +108,10 @@ struct PsPrice {
 /// tier cards with the split's, in the order they join: a split over s stages runs stage k (1 .. s - 1) on peers[s - 1 - k],
 /// so peers[0] always reads the last layers.  Every stage count up to `max_stages` and every cut each card's layers allow
 /// is priced; the cheapest wins, fewer stages on a tie.
+/// Prices a single-card prompt read over `chunks` starting at `cell0` (same model used inside price_prompt_split).
+double price_prompt_one_card(const PsCard& main_tier, int64_t cell0, const std::vector<int64_t>& chunks, int layers,
+                             double ple_us_token = -1.0);
+
 PsPrice price_prompt_split(const PsCard& main_tier, const PsCard& main_split, const std::vector<PsCard>& peers,
                            const PsPart& part, int max_stages, int layers);
 

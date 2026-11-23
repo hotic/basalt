@@ -39,6 +39,7 @@ struct Context {
     basalt::kernels::RopeScaling* rope_cfg = nullptr;
     std::string* err = nullptr;
     double* main_link_gbps = nullptr;
+    double* ple_us_token = nullptr;
     basalt::core::ModelGeometry* g = nullptr;
     int64_t* K = nullptr;
     std::set<std::string>* skip = nullptr;

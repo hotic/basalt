@@ -290,6 +290,7 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
     // slower link it must shrink or the window waits for it.  The real H2D bandwidth is probed once; from 20 GB/s up
     // the default stays.
     double main_link_gbps = 0;   // the probed host->device bandwidth (the prompt-time split's price reads it)
+    double ple_us_token = -1.0;  // probed first-chunk PLE wait per token in us (< 0: planner default)
     if (o.pcie_frac < 0.0) {
         const double base = 0.55;
         std::string bursts;
@@ -333,6 +334,7 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
     context.rope_cfg = &rope_cfg;
     context.err = &err;
     context.main_link_gbps = &main_link_gbps;
+    context.ple_us_token = &ple_us_token;
     return basalt::models::qwen4exp::generate::model(context);
 }
 

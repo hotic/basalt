@@ -183,7 +183,7 @@ constexpr double kPsRefGbps = 1792.0;
 constexpr double kPsGrowth = 2.5e-6;     // per cell of context before the token (the attention's block selection)
 constexpr double kPsUsToken = 7.1;       // us per token on the card that embeds it (the embedding, the PLE block)
 constexpr double kPsLinkEff = 0.85;      // the share of the probed link a chunk's expert stream gets
-constexpr double kPsPleUsToken = 46.0;   // the first chunk's wait for its n-gram rows, per token (either way)
+constexpr double kPsPleUsToken = 46.0;   // default first-chunk PLE cold wait per token (us) when unprobed
 constexpr double kPsDraftUsRow = 2.5;    // the draft layer's K/V of a row read back from the tier card
 constexpr double kPsMargin = 0.95;       // the split reads a part only when it is at least 5% cheaper
 
@@ -239,8 +239,9 @@ double ps_pipeline(const PsCard& m, const std::vector<const PsCard*>& st, const 
     for (size_t i = 0; i < n; ++i) {
         const int64_t T = part.split_chunks[i];
         const double pos = (double) at + 0.5 * (double) T;
+        const double ple_us = part.ple_us_token >= 0.0 ? part.ple_us_token : kPsPleUsToken;
         const double a = ps_stage(m, m, T, pos, 0, cuts[0], true, main_link, layers) +
-                         (i == 0 ? kPsPleUsToken * (double) T / 1000.0 : 0.0);
+                         (i == 0 ? ple_us * (double) T / 1000.0 : 0.0);
         const double hand = (double) T * (double) part.row_bytes;
         t = std::max(t, host_free);
         if (i + 1 < n && part.host_gbps > 0) {
@@ -276,17 +277,25 @@ double ps_pipeline(const PsCard& m, const std::vector<const PsCard*>& st, const 
 }
 }  // namespace
 
+double price_prompt_one_card(const PsCard& main_tier, int64_t cell0, const std::vector<int64_t>& chunks, int layers,
+                             double ple_us_token) {
+    const double ple_us = ple_us_token >= 0.0 ? ple_us_token : kPsPleUsToken;
+    const std::vector<double> tier_link = ps_link_table(main_tier, layers);
+    double ms = 0.0;
+    int64_t at = cell0;
+    for (size_t i = 0; i < chunks.size(); ++i) {
+        const int64_t T = chunks[i];
+        ms += ps_stage(main_tier, main_tier, T, (double) at + 0.5 * (double) T, 0, layers, true, tier_link, layers) +
+              (i == 0 ? ple_us * (double) T / 1000.0 : 0.0);
+        at += T;
+    }
+    return ms;
+}
+
 PsPrice price_prompt_split(const PsCard& main_tier, const PsCard& main_split, const std::vector<PsCard>& peers,
                            const PsPart& part, int max_stages, int layers) {
     PsPrice p;
-    const std::vector<double> tier_link = ps_link_table(main_tier, layers);
-    int64_t at = part.cell0;
-    for (size_t i = 0; i < part.tier_chunks.size(); ++i) {
-        const int64_t T = part.tier_chunks[i];
-        p.tier_ms += ps_stage(main_tier, main_tier, T, (double) at + 0.5 * (double) T, 0, layers, true, tier_link, layers) +
-                     (i == 0 ? kPsPleUsToken * (double) T / 1000.0 : 0.0);
-        at += T;
-    }
+    p.tier_ms = price_prompt_one_card(main_tier, part.cell0, part.tier_chunks, layers, part.ple_us_token);
     const int s_max = std::min({max_stages, (int) peers.size() + 1, kPsMaxStages});
     p.stage_ms.assign((size_t) std::max(s_max + 1, 0), 0.0);
     p.stage_cuts.assign(p.stage_ms.size(), {});

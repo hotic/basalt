@@ -173,6 +173,36 @@ bool QfnRequest::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t hea
     }
     auto [want_full, head_tok] = serve_loans::one_card_chunks(tokens, cap, !beside_ && runtime_.stages.empty(),
                                                            runtime_.o.prefill_auto_fit);
+    if (chunk <= 0 && resumed_chunk <= 0 && !beside_ && runtime_.stages.empty() && runtime_.o.prefill_auto_fit &&
+        head_tok > 0 && runtime_.main_link_gbps > 0) {
+        const auto [want_0, head_0] = serve_loans::one_card_chunks(tokens, cap, false, true);
+        if (want_0 != want_full || head_0 != head_tok) {
+            auto card_for = [&](int64_t ch) {
+                basalt::program::PsCard c;
+                c.link_gbps = runtime_.main_link_gbps;
+                c.stream_bytes.assign((size_t) runtime_.g.n_layers, 0.0);
+                const int64_t first = runtime_.xcache.slots() -
+                                      serve_loans::cache_slots_for(runtime_.xcache,
+                                                                   basalt::prefill::Prefill::bytes_needed(runtime_.g, runtime_.ss, ch));
+                for (int64_t l = 0; l < runtime_.g.n_layers; ++l)
+                    for (int64_t ex = 0; ex < runtime_.g.n_expert; ++ex) {
+                        const int32_t r = runtime_.host_res.empty() ? -1 : runtime_.host_res[(size_t) (l * runtime_.g.n_expert + ex)];
+                        if (r < 0 || r >= first) c.stream_bytes[(size_t) l] += (double) basalt::kernels::cpu::expert_layout().blob_bytes(l);
+                    }
+                return c;
+            };
+            const double ms_h = basalt::program::price_prompt_one_card(
+                card_for(want_full), 0, serve_loans::chunk_list(tokens, want_full, head_tok), (int) runtime_.g.n_layers,
+                runtime_.ple_us_token);
+            const double ms_0 = basalt::program::price_prompt_one_card(
+                card_for(want_0), 0, serve_loans::chunk_list(tokens, want_0, head_0), (int) runtime_.g.n_layers,
+                runtime_.ple_us_token);
+            if (ms_0 < ms_h) {
+                want_full = want_0;
+                head_tok = head_0;
+            }
+        }
+    }
     // a chunk the read must have: a split read's, or the one the read this continues had (if it fits)
     const int64_t fixed_chunk = chunk > 0 ? chunk : (resumed_chunk > 0 && resumed_chunk <= cap) ? resumed_chunk : 0;
     if (fixed_chunk > 0) {

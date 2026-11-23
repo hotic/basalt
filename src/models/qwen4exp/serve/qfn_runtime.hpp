@@ -38,6 +38,7 @@ struct Context {
     const bool& no_spec;
     std::string& err;
     double& main_link_gbps;
+    double& ple_us_token;
     basalt::core::ModelGeometry& g;
     int64_t& K;
     std::vector<std::pair<int32_t, int32_t>>& profile;

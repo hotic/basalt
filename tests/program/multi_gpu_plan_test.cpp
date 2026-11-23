@@ -382,6 +382,38 @@ int main() {
         CHECK(!price(small, Mechanism::LayerSplit).runs);
         CHECK(small.pick == Mechanism::ExpertTier && small.cut == 0);
     }
+    // price_prompt_one_card and PsPart::ple_us_token: fast PLE makes a link-bound card prefer equal chunks over an extra
+    // 16K head-chunk pass; ple_us_token < 0 keeps the 46 us/tok default.
+    {
+        auto card_5090 = [&](int64_t chunk) {
+            PsCard c;
+            c.mem_gbps = 1792.0;
+            c.link_gbps = 28.9;
+            // ~72 GiB of cold experts streamed per chunk on a 125B MoE card (link-bound over PCIe)
+            const double gb = chunk > 20000 ? 72.0 : 70.0;
+            c.stream_bytes.assign(48, gb * 1e9 / 48.0);
+            return c;
+        };
+        const std::vector<int64_t> with_head = prompt_chunk_list(52000, 26112, 16384);   // 3 chunks
+        const std::vector<int64_t> even_two = prompt_chunk_list(52000, 26112, 0);        // 2 chunks
+        CHECK(with_head.size() == 3 && even_two.size() == 2);
+        const double def_ms = price_prompt_one_card(card_5090(26112), 0, even_two, 48);
+        const double exp_ms = price_prompt_one_card(card_5090(26112), 0, even_two, 48, 46.0);
+        CHECK(std::abs(def_ms - exp_ms) < 1e-9);
+        const double zero_ple = price_prompt_one_card(card_5090(26112), 0, even_two, 48, 0.0);
+        CHECK(std::abs((def_ms - zero_ple) - 46.0 * (double) even_two[0] / 1000.0) < 1e-6);
+        const double head_fast = price_prompt_one_card(card_5090(26112), 0, with_head, 48, 30.0);
+        const double even_fast = price_prompt_one_card(card_5090(26112), 0, even_two, 48, 30.0);
+        CHECK(even_fast < head_fast);
+
+        PsPart lp;
+        lp.row_bytes = 65536;
+        lp.tier_chunks = even_two;
+        lp.split_chunks = even_two;
+        lp.ple_us_token = 0.0;
+        const PsPrice p0 = price_prompt_split(card_5090(26112), card_5090(26112), {}, lp, 1, 48);
+        CHECK(std::abs(p0.tier_ms - zero_ple) < 1e-9);
+    }
     if (g_fail) { std::printf("multi_gpu_plan_test: %d failures\n", g_fail); return 1; }
     std::printf("multi_gpu_plan_test: ok\n");
     return 0;
