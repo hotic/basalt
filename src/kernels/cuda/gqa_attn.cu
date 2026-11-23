@@ -150,17 +150,12 @@ __device__ __forceinline__ void ldsm_x2_t(unsigned& r0, unsigned& r1, const void
 }
 
 // ---------------------------------------------------------------- decode on the tensor cores
-// Block (split b, KV head, 16 query rows): the rows are the window's (row, head) pairs of the KV group, m = t G + h.  Its
-// chunks b, b + gx, ... of CHUNK cells: K and V decoded to fp16 in shared memory, S = Q K^T on mma m16n8k16 (fp16 in,
-// fp32 accumulate), an online softmax per row over its cells, O = O alpha + P V (P in fp16) on mma; the rows' partials
-// {max, sum, O} go to the merge.  Every row's arithmetic is its own (mma columns and rows never meet), the chunks follow
-// positions and the splits the capacity, so a row's bits are the same at any window width.
-template <int HD, bool I8>
-// (launched through launch_pdl: q and the cache come from the kernels before, read after pdl_wait, so not __restrict__)
-__global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int n_head, int n_kv, const DecSegs segs, int n_chunks,
-                                                         float scale, float* part_all) {
-    constexpr int LD = HD + 8;          // padded rows (halves): ldmatrix without bank conflicts
-    constexpr int NT = HD / 32;         // P V: a warp's 8-dim tiles
+// FP16 cache kernel (unchanged 128-thread path, 1 tile = 16 query rows per block).
+template <int HD>
+__global__ void __launch_bounds__(128) decode_mma_f16_kernel(const float* q_all, int n_head, int n_kv, const DecSegs segs,
+                                                             int n_chunks, float scale, float* part_all) {
+    constexpr int LD = HD + 8;
+    constexpr int NT = HD / 32;
     __shared__ __align__(16) __half qs[16][LD];
     __shared__ __align__(16) __half ks[CHUNK][LD];
     __shared__ __align__(16) __half vs[CHUNK][LD];
@@ -175,12 +170,10 @@ __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int
     const Range r = segs.r[sk];
     const __half* kc = segs.kc[sk];
     const __half* vc = segs.vc[sk];
-    const KvInt8 q8 = segs.q8[sk];
     const KvFar fr = segs.far_kv[sk];
     const float* q = q_all + (int64_t) row0 * n_head * HD;
     float* part = part_all + (int64_t) row0 * n_head * gx * (HD + 2);
     const int M = T * G, m0 = ((int) blockIdx.z - segs.tile0[sk]) * 16;
-    // the chunk's cells [from, to) of K and V as fp16 (int8: code x scale), zero past the last row's cells
     const auto load_kv = [&](int64_t c0, int64_t hi_max, int from, int to) {
         const int64_t cell0 = c0 % r.cap;
         for (int idx = tid; idx < CHUNK * HD / 8; idx += 128) {
@@ -192,36 +185,15 @@ __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int
                 if (ce >= r.cap) ce -= r.cap;
                 const bool far_kv = kv_far(fr, ce);
                 const int64_t row = ce * n_kv + kvh;
-                if (q8.k) {
-                    const KvInt8& c8 = far_kv ? fr.q8 : q8;
-                    const float sk = __half2float(__ushort_as_half(c8.ks[row * (HD / 64) + d8 / 64]));
-                    const float sv = __half2float(__ushort_as_half(c8.vs[row * (HD / 64) + d8 / 64]));
-                    int8_t kb[8], vb[8];
-                    *reinterpret_cast<int2*>(kb) = *reinterpret_cast<const int2*>(c8.k + row * HD + d8);
-                    *reinterpret_cast<int2*>(vb) = *reinterpret_cast<const int2*>(c8.v + row * HD + d8);
-                    __half2 kh[4], vh[4];
-#pragma unroll
-                    for (int e = 0; e < 4; ++e) {
-                        kh[e] = __floats2half2_rn((float) kb[2 * e] * sk, (float) kb[2 * e + 1] * sk);
-                        vh[e] = __floats2half2_rn((float) vb[2 * e] * sv, (float) vb[2 * e + 1] * sv);
-                    }
-                    kw = *reinterpret_cast<uint4*>(kh);
-                    vw = *reinterpret_cast<uint4*>(vh);
-                } else {
-                    kw = *reinterpret_cast<const uint4*>((far_kv ? (const __half*) fr.k : kc) + row * HD + d8);
-                    vw = *reinterpret_cast<const uint4*>((far_kv ? (const __half*) fr.v : vc) + row * HD + d8);
-                }
+                kw = *reinterpret_cast<const uint4*>((far_kv ? (const __half*) fr.k : kc) + row * HD + d8);
+                vw = *reinterpret_cast<const uint4*>((far_kv ? (const __half*) fr.v : vc) + row * HD + d8);
             }
             *reinterpret_cast<uint4*>(&ks[cell][d8]) = kw;
             *reinterpret_cast<uint4*>(&vs[cell][d8]) = vw;
         }
     };
-    // the next chunk's cells are fetched into registers while this one is computed (the same values, the same order of
-    // arithmetic: only when the loads are issued changes); an int8 cache's codes take the first two words
     constexpr int NI = CHUNK * HD / 8 / 128;
-    using Word = std::conditional_t<I8, uint2, uint4>;
-    Word pk[NI], pv[NI];
-    uint16_t psk[NI], psv[NI];
+    uint4 pk[NI], pv[NI];
     unsigned pmask = 0;
     const auto fetch = [&](int64_t c0, int64_t hi_max) {
         const int64_t cell0 = c0 % r.cap;
@@ -234,16 +206,8 @@ __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int
                 if (ce >= r.cap) ce -= r.cap;
                 const bool far_kv = kv_far(fr, ce);
                 const int64_t row = ce * n_kv + kvh;
-                if constexpr (I8) {
-                    const KvInt8& c8 = far_kv ? fr.q8 : q8;
-                    psk[j] = c8.ks[row * (HD / 64) + d8 / 64];
-                    psv[j] = c8.vs[row * (HD / 64) + d8 / 64];
-                    pk[j] = *reinterpret_cast<const uint2*>(c8.k + row * HD + d8);
-                    pv[j] = *reinterpret_cast<const uint2*>(c8.v + row * HD + d8);
-                } else {
-                    pk[j] = *reinterpret_cast<const uint4*>((far_kv ? (const __half*) fr.k : kc) + row * HD + d8);
-                    pv[j] = *reinterpret_cast<const uint4*>((far_kv ? (const __half*) fr.v : vc) + row * HD + d8);
-                }
+                pk[j] = *reinterpret_cast<const uint4*>((far_kv ? (const __half*) fr.k : kc) + row * HD + d8);
+                pv[j] = *reinterpret_cast<const uint4*>((far_kv ? (const __half*) fr.v : vc) + row * HD + d8);
                 pmask |= 1u << j;
             }
         }
@@ -252,34 +216,12 @@ __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int
 #pragma unroll
         for (int j = 0; j < NI; ++j) {
             const int idx = tid + j * 128, cell = idx / (HD / 8), d8 = (idx - cell * (HD / 8)) * 8;
-            uint4 kw = make_uint4(0, 0, 0, 0), vw = make_uint4(0, 0, 0, 0);
-            if ((pmask >> j) & 1u) {
-                if constexpr (I8) {
-                    const float sk = __half2float(__ushort_as_half(psk[j]));
-                    const float sv = __half2float(__ushort_as_half(psv[j]));
-                    int8_t kb[8], vb[8];
-                    *reinterpret_cast<uint2*>(kb) = pk[j];
-                    *reinterpret_cast<uint2*>(vb) = pv[j];
-                    __half2 kh[4], vh[4];
-#pragma unroll
-                    for (int e = 0; e < 4; ++e) {
-                        kh[e] = __floats2half2_rn((float) kb[2 * e] * sk, (float) kb[2 * e + 1] * sk);
-                        vh[e] = __floats2half2_rn((float) vb[2 * e] * sv, (float) vb[2 * e + 1] * sv);
-                    }
-                    kw = *reinterpret_cast<uint4*>(kh);
-                    vw = *reinterpret_cast<uint4*>(vh);
-                } else {
-                    kw = pk[j];
-                    vw = pv[j];
-                }
-            }
-            *reinterpret_cast<uint4*>(&ks[cell][d8]) = kw;
-            *reinterpret_cast<uint4*>(&vs[cell][d8]) = vw;
+            const bool ok = ((pmask >> j) & 1u) != 0;
+            *reinterpret_cast<uint4*>(&ks[cell][d8]) = ok ? pk[j] : make_uint4(0, 0, 0, 0);
+            *reinterpret_cast<uint4*>(&vs[cell][d8]) = ok ? pv[j] : make_uint4(0, 0, 0, 0);
         }
     };
     bool staged = false;
-    // before the wait: the rows' ranges (positions come from the host) and, of the block's first chunk, the cells below
-    // the window's first position, which earlier windows wrote; the window's own cells and the queries come after it
     if (tid < 16) {
         const int m = m0 + tid;
         rlo[tid] = m < M ? row_lo(r, m / G) : 0;
@@ -292,7 +234,7 @@ __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int
 #pragma unroll
     for (int i = 0; i < 16; ++i) hi_max = max(hi_max, rhi[i]);
     const int64_t first_c0 = (int64_t) (r.base + blockIdx.x) * CHUNK;
-    const int64_t own = row_pos0(r);   // cells from the window's first position on are this window's (written just before)
+    const int64_t own = row_pos0(r);
     const int pre = (int) max((int64_t) 0, min((int64_t) CHUNK, own - first_c0));
     if ((int) blockIdx.x < n_chunks && first_c0 < hi_max && pre > 0) load_kv(first_c0, hi_max, 0, pre);
     pdl_wait();
@@ -306,19 +248,18 @@ __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int
     for (int n = 0; n < NT; ++n) acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.0f;
     for (int chunk = blockIdx.x; chunk < n_chunks; chunk += gx) {
         const int64_t c0 = (int64_t) (r.base + chunk) * CHUNK;
-        if (c0 >= hi_max) break;   // past every row's cells
+        if (c0 >= hi_max) break;
         if (staged) commit();
-        else load_kv(c0, hi_max, chunk == (int) blockIdx.x ? pre : 0, CHUNK);   // the first chunk's earlier cells are in
+        else load_kv(c0, hi_max, chunk == (int) blockIdx.x ? pre : 0, CHUNK);
         staged = false;
         __syncthreads();
-        if (chunk + gx < n_chunks) {   // the chunk after this one, in flight while this one is computed
+        if (chunk + gx < n_chunks) {
             const int64_t c02 = (int64_t) (r.base + chunk + gx) * CHUNK;
             if (c02 < hi_max) {
                 fetch(c02, hi_max);
                 staged = true;
             }
         }
-        // S = Q K^T: warp w the cells 8w .. 8w + 7
         for (int nc = warp; nc < CHUNK / 8; nc += 4) {
             float s4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
@@ -334,15 +275,14 @@ __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int
             ss[g + 8][nc * 8 + 2 * c + 1] = s4[3];
         }
         __syncthreads();
-        // each row: the chunk's max over its cells, p = exp2(s - max') there (0 elsewhere), the running {max, sum}
         for (int i = warp; i < 16; i += 4) {
-            float pv[CHUNK / 32], mx = kNeg;
+            float pv_r[CHUNK / 32], mx = kNeg;
 #pragma unroll
             for (int u = 0; u < CHUNK / 32; ++u) {
                 const int cc = lane + 32 * u;
                 const int64_t pos = c0 + cc;
-                pv[u] = pos >= rlo[i] && pos < rhi[i] ? ss[i][cc] : -INFINITY;
-                mx = fmaxf(mx, pv[u]);
+                pv_r[u] = pos >= rlo[i] && pos < rhi[i] ? ss[i][cc] : -INFINITY;
+                mx = fmaxf(mx, pv_r[u]);
             }
 #pragma unroll
             for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
@@ -350,7 +290,7 @@ __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int
             float l = 0.0f;
 #pragma unroll
             for (int u = 0; u < CHUNK / 32; ++u) {
-                const float p = pv[u] == -INFINITY ? 0.0f : exp2f(pv[u] - mnew);
+                const float p = pv_r[u] == -INFINITY ? 0.0f : exp2f(pv_r[u] - mnew);
                 ps[i][lane + 32 * u] = __float2half_rn(p);
                 l += p;
             }
@@ -363,7 +303,6 @@ __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int
             }
         }
         __syncthreads();
-        // O = O alpha + P V: warp w the dims w HD / 4 ..
         {
             const float ag = ra[g], ag8 = ra[g + 8];
 #pragma unroll
@@ -385,7 +324,7 @@ __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int
                 }
             }
         }
-        __syncthreads();   // the shared tiles are free for the next chunk
+        __syncthreads();
     }
 #pragma unroll
     for (int hr = 0; hr < 2; ++hr) {
@@ -405,17 +344,370 @@ __global__ void __launch_bounds__(128) decode_mma_kernel(const float* q_all, int
     }
 }
 
+// INT8 cache multi-tile warp-group kernel: NWG warp-groups of 4 warps (NWG * 128 threads) run NWG 16-row query
+// tiles in parallel while sharing compact 16 KiB int8 K/V smem loaded via 16-byte uint4 transactions.  Once Q K^T
+// finishes reading ks, ss[NWG] aliases onto ks (6.3 KiB <= 8 KiB) so smem stays < 48 KiB for NWG=1..3, giving 2
+// blocks/SM (1 wave on Blackwell) and full parallel tensor-core throughput across all NWG tiles.  Bits are identical
+// to staging fp16 K/V in smem.
+template <int HD, int NWG>
+struct DecI8Smem {
+    static constexpr int LDQ = HD + 8;
+    static constexpr int G4 = HD / 64;
+    alignas(16) __half qs[NWG][16][LDQ];
+    union {
+        alignas(16) int8_t ks[CHUNK][HD];
+        float ss[NWG][16][CHUNK + 1];
+    };
+    alignas(16) int8_t vs[CHUNK][HD];
+    uint16_t ksc[CHUNK][G4];
+    uint16_t vsc[CHUNK][G4];
+    alignas(16) __half ps[NWG][16][CHUNK + 8];
+    float rm[NWG][16], rl[NWG][16], ra[NWG][16];
+    int64_t rlo[NWG][16], rhi[NWG][16], tile_hi[NWG];
+};
+
+template <int HD, int NWG>
+__global__ void __launch_bounds__(NWG * 128, 2) decode_mma_i8_kernel(const float* q_all, int n_head, int n_kv, const DecSegs segs,
+                                                                     int n_chunks, float scale, float* part_all) {
+    constexpr int NT = HD / 32;
+    constexpr int G4 = HD / 64;
+    constexpr int THREADS = NWG * 128;
+    constexpr int VEC16 = CHUNK * HD / 16;          // 512 (HD=256) or 256 (HD=128)
+    constexpr int NI = (VEC16 + THREADS - 1) / THREADS;
+    constexpr int NSC = CHUNK * G4;                 // 128 (HD=256) or 64 (HD=128)
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    auto& sm = *reinterpret_cast<DecI8Smem<HD, NWG>*>(smem_raw);
+    pdl_launch_dependents();
+    const int tid = threadIdx.x, wg = tid >> 7, warp = (tid >> 5) & 3, lane = tid & 31, g = lane >> 2, c = lane & 3;
+    const int kvh = blockIdx.y, gx = gridDim.x, G = n_head / n_kv;
+    const int sk = seg_of(segs.tile0, segs.n, (int) blockIdx.z), row0 = segs.row0[sk], T = segs.row0[sk + 1] - row0;
+    const Range r = segs.r[sk];
+    const KvInt8 q8 = segs.q8[sk];
+    const KvFar fr = segs.far_kv[sk];
+    const float* q = q_all + (int64_t) row0 * n_head * HD;
+    float* part = part_all + (int64_t) row0 * n_head * gx * (HD + 2);
+    const int M = T * G, m0_blk = ((int) blockIdx.z - segs.tile0[sk]) * (NWG * 16);
+
+    auto swiz = [](int cell, int d) -> int { return d ^ ((cell & 7) << 4); };
+
+    const auto load_kv = [&](int64_t c0, int64_t hi_max, int from, int to) {
+        const int64_t cell0 = c0 % r.cap;
+#pragma unroll
+        for (int j = 0; j < NI; ++j) {
+            const int idx = tid + j * THREADS;
+            if (idx >= VEC16) break;
+            const int cell = idx / (HD / 16), d16 = (idx - cell * (HD / 16)) * 16;
+            if (cell < from || cell >= to) continue;
+            uint4 kw = make_uint4(0, 0, 0, 0), vw = make_uint4(0, 0, 0, 0);
+            if (c0 + cell < hi_max) {
+                int64_t ce = cell0 + cell;
+                if (ce >= r.cap) ce -= r.cap;
+                const KvInt8& c8 = kv_far(fr, ce) ? fr.q8 : q8;
+                const int64_t row = ce * n_kv + kvh;
+                kw = *reinterpret_cast<const uint4*>(c8.k + row * HD + d16);
+                vw = *reinterpret_cast<const uint4*>(c8.v + row * HD + d16);
+            }
+            const int sd = swiz(cell, d16);
+            *reinterpret_cast<uint4*>(&sm.ks[cell][sd]) = kw;
+            *reinterpret_cast<uint4*>(&sm.vs[cell][sd]) = vw;
+        }
+        if (tid < NSC) {
+            const int cell = tid / G4, grp = tid - cell * G4;
+            if (cell >= from && cell < to) {
+                uint16_t ks_v = 0, vs_v = 0;
+                if (c0 + cell < hi_max) {
+                    int64_t ce = cell0 + cell;
+                    if (ce >= r.cap) ce -= r.cap;
+                    const KvInt8& c8 = kv_far(fr, ce) ? fr.q8 : q8;
+                    const int64_t row = ce * n_kv + kvh;
+                    ks_v = c8.ks[row * G4 + grp];
+                    vs_v = c8.vs[row * G4 + grp];
+                }
+                sm.ksc[cell][grp] = ks_v;
+                sm.vsc[cell][grp] = vs_v;
+            }
+        }
+    };
+
+    uint4 pk[NI], pv[NI];
+    uint16_t psk = 0, psv = 0;
+    unsigned pmask = 0;
+    bool sc_ok = false;
+    const auto fetch = [&](int64_t c0, int64_t hi_max) {
+        const int64_t cell0 = c0 % r.cap;
+        pmask = 0;
+#pragma unroll
+        for (int j = 0; j < NI; ++j) {
+            const int idx = tid + j * THREADS;
+            if (idx >= VEC16) break;
+            const int cell = idx / (HD / 16), d16 = (idx - cell * (HD / 16)) * 16;
+            if (c0 + cell < hi_max) {
+                int64_t ce = cell0 + cell;
+                if (ce >= r.cap) ce -= r.cap;
+                const KvInt8& c8 = kv_far(fr, ce) ? fr.q8 : q8;
+                const int64_t row = ce * n_kv + kvh;
+                pk[j] = *reinterpret_cast<const uint4*>(c8.k + row * HD + d16);
+                pv[j] = *reinterpret_cast<const uint4*>(c8.v + row * HD + d16);
+                pmask |= 1u << j;
+            }
+        }
+        sc_ok = false;
+        if (tid < NSC) {
+            const int cell = tid / G4, grp = tid - cell * G4;
+            if (c0 + cell < hi_max) {
+                int64_t ce = cell0 + cell;
+                if (ce >= r.cap) ce -= r.cap;
+                const KvInt8& c8 = kv_far(fr, ce) ? fr.q8 : q8;
+                const int64_t row = ce * n_kv + kvh;
+                psk = c8.ks[row * G4 + grp];
+                psv = c8.vs[row * G4 + grp];
+                sc_ok = true;
+            }
+        }
+    };
+    const auto commit = [&]() {
+#pragma unroll
+        for (int j = 0; j < NI; ++j) {
+            const int idx = tid + j * THREADS;
+            if (idx >= VEC16) break;
+            const int cell = idx / (HD / 16), d16 = (idx - cell * (HD / 16)) * 16;
+            const bool ok = ((pmask >> j) & 1u) != 0;
+            const int sd = swiz(cell, d16);
+            *reinterpret_cast<uint4*>(&sm.ks[cell][sd]) = ok ? pk[j] : make_uint4(0, 0, 0, 0);
+            *reinterpret_cast<uint4*>(&sm.vs[cell][sd]) = ok ? pv[j] : make_uint4(0, 0, 0, 0);
+        }
+        if (tid < NSC) {
+            const int cell = tid / G4, grp = tid - cell * G4;
+            sm.ksc[cell][grp] = sc_ok ? psk : 0;
+            sm.vsc[cell][grp] = sc_ok ? psv : 0;
+        }
+    };
+
+    for (int idx = tid; idx < NWG * 16; idx += THREADS) {
+        const int w = idx >> 4, i = idx & 15, m = m0_blk + w * 16 + i;
+        sm.rlo[w][i] = m < M ? row_lo(r, m / G) : 0;
+        sm.rhi[w][i] = m < M ? row_hi(r, m / G) : 0;
+        sm.rm[w][i] = kNeg;
+        sm.rl[w][i] = 0.0f;
+    }
+    __syncthreads();
+    if (tid < NWG) {
+        int64_t hm = 0;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) hm = max(hm, sm.rhi[tid][i]);
+        sm.tile_hi[tid] = hm;
+    }
+    __syncthreads();
+    int64_t hi_max = 0;
+#pragma unroll
+    for (int w = 0; w < NWG; ++w) hi_max = max(hi_max, sm.tile_hi[w]);
+    const int64_t my_tile_hi = sm.tile_hi[wg];
+    const int64_t first_c0 = (int64_t) (r.base + blockIdx.x) * CHUNK;
+    const int64_t own = row_pos0(r);
+    const int pre = (int) max((int64_t) 0, min((int64_t) CHUNK, own - first_c0));
+    if ((int) blockIdx.x < n_chunks && first_c0 < hi_max && pre > 0) load_kv(first_c0, hi_max, 0, pre);
+    pdl_wait();
+    for (int idx = tid; idx < NWG * 16 * HD; idx += THREADS) {
+        const int w = idx / (16 * HD), rem = idx - w * (16 * HD);
+        const int i = rem / HD, d = rem - i * HD, m = m0_blk + w * 16 + i;
+        const float v = m < M ? q[((int64_t) (m / G) * n_head + kvh * G + m % G) * HD + d] * scale : 0.0f;
+        sm.qs[w][i][d] = __float2half_rn(v);
+    }
+
+    bool staged = false;
+    float acc[NT][4];
+#pragma unroll
+    for (int n = 0; n < NT; ++n) acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.0f;
+
+    auto pack_h2_u32 = [](float lo, float hi) -> unsigned {
+        const __half2 h = __floats2half2_rn(lo, hi);
+        return *reinterpret_cast<const unsigned*>(&h);
+    };
+
+    const int krow = warp * 8 + g;
+    const int v_grp = (warp * (HD / 4)) >> 6;
+
+    for (int chunk = blockIdx.x; chunk < n_chunks; chunk += gx) {
+        const int64_t c0 = (int64_t) (r.base + chunk) * CHUNK;
+        if (c0 >= hi_max) break;
+        if (staged) commit();
+        else load_kv(c0, hi_max, chunk == (int) blockIdx.x ? pre : 0, CHUNK);
+        staged = false;
+        __syncthreads();
+        if (chunk + gx < n_chunks) {
+            const int64_t c02 = (int64_t) (r.base + chunk + gx) * CHUNK;
+            if (c02 < hi_max) {
+                fetch(c02, hi_max);
+                staged = true;
+            }
+        }
+        const bool active = c0 < my_tile_hi;
+
+        // Phase 1: Q K^T (all NWG warp-groups in parallel reading shared sm.ks)
+        float s4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        if (active) {
+#pragma unroll
+            for (int grp = 0; grp < G4; ++grp) {
+                const float sk_v = __half2float(__ushort_as_half(sm.ksc[krow][grp]));
+#pragma unroll
+                for (int kk = 0; kk < 64; kk += 16) {
+                    const int k = grp * 64 + kk;
+                    const int sd0 = swiz(krow, k + 2 * c);
+                    const uint16_t k01 = *reinterpret_cast<const uint16_t*>(&sm.ks[krow][sd0]);
+                    const uint16_t k89 = *reinterpret_cast<const uint16_t*>(&sm.ks[krow][sd0 + 8]);
+                    const unsigned b0 = pack_h2_u32((float) (int8_t) (k01 & 0xff) * sk_v, (float) (int8_t) (k01 >> 8) * sk_v);
+                    const unsigned b1 = pack_h2_u32((float) (int8_t) (k89 & 0xff) * sk_v, (float) (int8_t) (k89 >> 8) * sk_v);
+                    unsigned a0, a1, a2, a3;
+                    ldsm_x4(a0, a1, a2, a3, &sm.qs[wg][lane & 15][k + (lane >> 4) * 8]);
+                    mma16816(s4, a0, a1, a2, a3, b0, b1);
+                }
+            }
+        }
+        __syncthreads();   // every warp-group finished reading sm.ks; sm.ss aliases onto sm.ks now
+
+        // Phase 2: store scores into sm.ss[wg] and run online softmax in parallel across all NWG warp-groups
+        if (active) {
+            sm.ss[wg][g][warp * 8 + 2 * c] = s4[0];
+            sm.ss[wg][g][warp * 8 + 2 * c + 1] = s4[1];
+            sm.ss[wg][g + 8][warp * 8 + 2 * c] = s4[2];
+            sm.ss[wg][g + 8][warp * 8 + 2 * c + 1] = s4[3];
+        }
+        __syncthreads();
+        if (active) {
+            for (int i = warp; i < 16; i += 4) {
+                const int64_t rlo = sm.rlo[wg][i], rhi = sm.rhi[wg][i];
+                float pv_r[CHUNK / 32], mx = kNeg;
+#pragma unroll
+                for (int u = 0; u < CHUNK / 32; ++u) {
+                    const int cc = lane + 32 * u;
+                    const int64_t pos = c0 + cc;
+                    pv_r[u] = pos >= rlo && pos < rhi ? sm.ss[wg][i][cc] : -INFINITY;
+                    mx = fmaxf(mx, pv_r[u]);
+                }
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+                const float mold = sm.rm[wg][i], mnew = fmaxf(mold, mx);
+                float l = 0.0f;
+#pragma unroll
+                for (int u = 0; u < CHUNK / 32; ++u) {
+                    const float p = pv_r[u] == -INFINITY ? 0.0f : exp2f(pv_r[u] - mnew);
+                    sm.ps[wg][i][lane + 32 * u] = __float2half_rn(p);
+                    l += p;
+                }
+                l = warp_sum(l);
+                if (lane == 0) {
+                    const float alpha = exp2f(mold - mnew);
+                    sm.ra[wg][i] = alpha;
+                    sm.rl[wg][i] = fmaf(sm.rl[wg][i], alpha, l);
+                    sm.rm[wg][i] = mnew;
+                }
+            }
+        }
+        __syncthreads();
+
+        // Phase 3: O = O alpha + P V (all NWG warp-groups in parallel reading shared sm.vs)
+        if (active) {
+            const float ag = sm.ra[wg][g], ag8 = sm.ra[wg][g + 8];
+#pragma unroll
+            for (int n = 0; n < NT; ++n) {
+                acc[n][0] *= ag;
+                acc[n][1] *= ag;
+                acc[n][2] *= ag8;
+                acc[n][3] *= ag8;
+            }
+#pragma unroll
+            for (int kk = 0; kk < CHUNK; kk += 16) {
+                unsigned a0, a1, a2, a3;
+                ldsm_x4(a0, a1, a2, a3, &sm.ps[wg][lane & 15][kk + (lane >> 4) * 8]);
+                const int c0_v = kk + 2 * c, c1_v = c0_v + 1, c2_v = c0_v + 8, c3_v = c0_v + 9;
+                const float sv0 = __half2float(__ushort_as_half(sm.vsc[c0_v][v_grp]));
+                const float sv1 = __half2float(__ushort_as_half(sm.vsc[c1_v][v_grp]));
+                const float sv2 = __half2float(__ushort_as_half(sm.vsc[c2_v][v_grp]));
+                const float sv3 = __half2float(__ushort_as_half(sm.vsc[c3_v][v_grp]));
+#pragma unroll
+                for (int n = 0; n < NT; ++n) {
+                    const int d = warp * (HD / 4) + n * 8 + g;
+                    const unsigned b0 = pack_h2_u32((float) sm.vs[c0_v][swiz(c0_v, d)] * sv0, (float) sm.vs[c1_v][swiz(c1_v, d)] * sv1);
+                    const unsigned b1 = pack_h2_u32((float) sm.vs[c2_v][swiz(c2_v, d)] * sv2, (float) sm.vs[c3_v][swiz(c3_v, d)] * sv3);
+                    mma16816(acc[n], a0, a1, a2, a3, b0, b1);
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int hr = 0; hr < 2; ++hr) {
+        const int i = g + 8 * hr, m = m0_blk + wg * 16 + i;
+        if (m >= M) continue;
+        float* out = part + (((int64_t) (m / G) * n_head + (int64_t) kvh * G + m % G) * gx + blockIdx.x) * (HD + 2);
+        if (warp == 0 && c == 0) {
+            out[0] = sm.rm[wg][i];
+            out[1] = sm.rl[wg][i];
+        }
+#pragma unroll
+        for (int n = 0; n < NT; ++n) {
+            const int d = warp * (HD / 4) + n * 8 + 2 * c;
+            out[2 + d] = acc[n][2 * hr];
+            out[3 + d] = acc[n][2 * hr + 1];
+        }
+    }
+}
+
+template <int HD, int NWG>
+void launch_decode_i8(dim3 grid, cudaStream_t s, const float* q, int n_head, int n_kv, const DecSegs& segs, int n_chunks,
+                      float scale, float* scratch) {
+    constexpr int kSmem = (int) sizeof(DecI8Smem<HD, NWG>);
+    static std::atomic<bool> configured[64];
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev >= 0 && dev < 64 && !configured[dev].load(std::memory_order_acquire)) {
+        if constexpr (kSmem > 48 * 1024) {
+            if (cudaFuncSetAttribute(decode_mma_i8_kernel<HD, NWG>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem) !=
+                cudaSuccess) {
+                basalt::log::error("basalt", "gqa decode i8: shared-memory opt-in (%d B) failed", kSmem);
+                std::exit(1);
+            }
+        }
+        if constexpr (kSmem > 32 * 1024) {
+            (void) cudaFuncSetAttribute(decode_mma_i8_kernel<HD, NWG>, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                        cudaSharedmemCarveoutMaxShared);
+        }
+
+        configured[dev].store(true, std::memory_order_release);
+    }
+    launch_pdl(decode_mma_i8_kernel<HD, NWG>, grid, dim3(NWG * 128), (size_t) kSmem, s, q, n_head, n_kv, segs, n_chunks, scale,
+               scratch);
+}
+
 // segs.n and segs.row0 set: the tiles from the rows, then both kernels over every segment
 template <int HD>
 void launch_segs(const float* q, int n_head, int n_kv, DecSegs& segs, float* scratch, int n_chunks, float* out, cudaStream_t s,
                  const float* gate_q = nullptr, uint16_t* gated16 = nullptr) {
     const float scale = 1.4426950408889634f / sqrtf((float) HD);
     const int gx = decode_splits(n_chunks);
-    for (int k = 0; k < segs.n; ++k)
-        segs.tile0[k + 1] = segs.tile0[k] + ((segs.row0[k + 1] - segs.row0[k]) * (n_head / n_kv) + 15) / 16;
-    const dim3 grid((unsigned) gx, (unsigned) n_kv, (unsigned) segs.tile0[segs.n]);
-    if (segs.q8[0].k) launch_pdl(decode_mma_kernel<HD, true>, grid, dim3(128), 0, s, q, n_head, n_kv, segs, n_chunks, scale, scratch);
-    else launch_pdl(decode_mma_kernel<HD, false>, grid, dim3(128), 0, s, q, n_head, n_kv, segs, n_chunks, scale, scratch);
+    const int G = n_head / n_kv;
+    const bool i8 = segs.q8[0].k != nullptr;
+    if (i8) {
+        int max_nt = 1;
+        for (int k = 0; k < segs.n; ++k) {
+            const int nt = ((segs.row0[k + 1] - segs.row0[k]) * G + 15) / 16;
+            if (nt > max_nt) max_nt = nt;
+        }
+        const int tg = max_nt >= 3 ? 3 : (max_nt >= 2 ? 2 : 1);
+        for (int k = 0; k < segs.n; ++k) {
+            const int nt = ((segs.row0[k + 1] - segs.row0[k]) * G + 15) / 16;
+            segs.tile0[k + 1] = segs.tile0[k] + (nt + tg - 1) / tg;
+        }
+        const dim3 grid((unsigned) gx, (unsigned) n_kv, (unsigned) segs.tile0[segs.n]);
+        if (tg == 3) launch_decode_i8<HD, 3>(grid, s, q, n_head, n_kv, segs, n_chunks, scale, scratch);
+        else if (tg == 2) launch_decode_i8<HD, 2>(grid, s, q, n_head, n_kv, segs, n_chunks, scale, scratch);
+        else launch_decode_i8<HD, 1>(grid, s, q, n_head, n_kv, segs, n_chunks, scale, scratch);
+    } else {
+        for (int k = 0; k < segs.n; ++k)
+            segs.tile0[k + 1] = segs.tile0[k] + ((segs.row0[k + 1] - segs.row0[k]) * G + 15) / 16;
+        const dim3 grid((unsigned) gx, (unsigned) n_kv, (unsigned) segs.tile0[segs.n]);
+        launch_pdl(decode_mma_f16_kernel<HD>, grid, dim3(128), 0, s, q, n_head, n_kv, segs, n_chunks, scale, scratch);
+    }
     check("gqa decode attention");
     launch_pdl(decode_merge_kernel<HD>, dim3((unsigned) n_head, (unsigned) segs.row0[segs.n]), dim3(HD), 0, s,
                (const float*) scratch, n_head, gx, out, gate_q, gated16, segs);
