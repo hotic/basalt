@@ -96,6 +96,14 @@ public:
     int p_threads() const { return topo_.p_threads; }
     int e_cores() const { return topo_.e_cores; }
     PoolAffinity affinity() const { return affinity_; }
+    /// True when the pool runs split across two peer L3 cache domains (e.g. dual-CCD X3D).
+    bool dual_ccd() const { return dual_ccd_; }
+    /// The L3 domain (0 or 1) of worker `id` (-1 for host), or 0 when not dual-CCD.
+    int worker_ccd(int id) const;
+    /// Worker `id`'s 0-based rank among active workers in its L3 domain (and that domain's active worker count).
+    int ccd_worker_rank(int id, int active, int& ccd_workers) const;
+    /// Split row boundary of `[0, rows)` between L3 domain 0 and domain 1 (16-row aligned).
+    static int ccd_split_row(int rows) { return rows >= 32 ? (((rows / 2) + 15) & ~15) : rows; }
 
     /// A native pack's layer (ggml-cpu arithmetic, `nact` activations): every expert split by rows across all threads.
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n);
@@ -116,6 +124,8 @@ public:
     /// overlaps a batch; it must not write anything a batch reads.
     using IdleFn = void (*)(void* ctx, int worker, int workers, const std::atomic<bool>& stop);
     void idle_start(IdleFn fn, void* ctx);
+    /// Non-blocking hint that real work has arrived so idle workers exit before idle_stop() waits.
+    void idle_signal_stop();
     void idle_stop();
     /// The native batches' time shared out by bytes, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
@@ -156,6 +166,9 @@ private:
     void native_down_range(int e, int r0, int r1);
     /// Claim the next job of batch `epoch`, or -1 (that batch is exhausted, or it is not the current one).
     int claim(uint32_t epoch);
+    int claim_from(std::atomic<uint64_t>& head, uint32_t epoch, int limit = -1);
+    void run_dual_task(int ccd, int ci, uint32_t epoch);
+    void pin_host_once();
     /// Publish the batch whose description the caller has just written: reset `done`, then `head`, then the epoch.
     uint32_t begin_batch(int n);
     /// The host's waits, bounded by `kStall`.
@@ -186,6 +199,7 @@ private:
     std::atomic<int32_t> hstate_{kIdle};
     std::atomic<int64_t> hstate_ms_{0};
     alignas(64) std::atomic<uint64_t> head_{0};   // epoch << 32 | njobs << 16 | next index
+    alignas(64) std::atomic<uint64_t> head_ccd_[2]{{0}, {0}};   // per-CCD queues in dual-CCD mode
     alignas(64) std::atomic<uint32_t> done_{0};
     alignas(64) std::atomic<uint32_t> parked_{0};
     alignas(64) std::atomic<uint32_t> epoch_{0};
@@ -222,6 +236,7 @@ private:
     /// The first row of `part` of `parts` over `rows` rows (`part == parts` gives `rows`): equal parts, then
     /// `fused_tail_` quarter-size ones.
     int part_row(int part, int parts, int rows) const;
+    int part_row_range(int part, int parts, int r_base, int r_len) const;
     /// Sets up one batch of at most kMaxSplitMulti experts: its parts per expert; the tasks it makes and the gate/up
     /// share of its bytes.
     int split_multi_batch(const NativeFmt& f, ExpertJobMulti* jobs, int n, double& gu_share);
@@ -233,6 +248,15 @@ private:
     std::vector<SplitBufMulti> split_multi_;
     PoolAffinity affinity_ = PoolAffinity::All;
     CpuTopology topo_;
+    bool pin_threads_ = false;
+    bool dual_ccd_ = false;
+    bool use_dual_ = false;
+    std::atomic<bool> host_pinned_{false};
+    int host_ccd_ = 0;
+    int dual_gu_mid_ = 0, dual_d_mid_ = 0;
+    int dual_ccd_tasks_ = 0;
+    std::vector<int> worker_cpu_;
+    std::vector<int> worker_ccd_;
 };
 
 }  // namespace basalt::kernels::cpu

@@ -42,4 +42,7 @@ CpuInfo cpu_info();
 /// Intel die. Processors are named as above. Empty when the OS does not say.
 std::vector<std::vector<int>> cpu_l3_groups();
 
+/// Pin the calling thread to the logical processor `cpu` (>= 0). Best-effort: true on success.
+bool pin_current_thread(int cpu);
+
 }  // namespace basalt::platform

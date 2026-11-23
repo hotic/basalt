@@ -182,6 +182,14 @@ std::vector<std::vector<int>> cpu_l3_groups() {
     return groups;
 }
 
+bool pin_current_thread(int cpu) {
+    if (cpu < 0) return false;
+    GROUP_AFFINITY ga{};
+    ga.Group = (WORD) (cpu / 64);
+    ga.Mask = KAFFINITY(1) << (cpu % 64);
+    return SetThreadGroupAffinity(GetCurrentThread(), &ga, nullptr) != 0;
+}
+
 #else
 // --------------------------------------------------------------------------------------------- Linux
 
@@ -418,6 +426,15 @@ std::vector<std::vector<int>> cpu_l3_groups() {
         }
     }
     return groups;
+}
+
+bool pin_current_thread(int cpu) {
+    if (cpu < 0) return false;
+    const int count = std::max(CPU_SETSIZE, cpu + 64);
+    detail::LinuxCpuSet set(count);
+    if (!set.set) return false;
+    CPU_SET_S(cpu, set.bytes, set.set);
+    return pthread_setaffinity_np(pthread_self(), set.bytes, set.set) == 0;
 }
 
 #endif

@@ -266,27 +266,55 @@ int main(int argc, char** argv) {
             job.nact[t] = nact[t].data();
             job.out[t] = out[t];
         }
+        cpu::ExpertPool pool((std::max)(1, (int) cpu::physical_cores(true).size()));
         struct Read {
+            const cpu::ExpertPool* pool = nullptr;
             const uint8_t* blob = nullptr;
-            size_t bytes = 0, down_off = 0;
+            size_t bytes = 0, up_off = 0, down_off = 0, gu_row = 0, d_row = 0;
+            int n_ff = 0, n_embd = 0;
             std::atomic<int> done{0};
             std::atomic<uint64_t> sink{0};
         } rd;
+        rd.pool = &pool;
         rd.bytes = f.bytes;
+        rd.up_off = f.up_off;
         rd.down_off = f.down_off;
-        auto read_fn = [](void* ctx, int w, int W, const std::atomic<bool>& stop) {   // gate/up rows first, then down
+        rd.gu_row = f.gu_row;
+        rd.d_row = f.d_row;
+        rd.n_ff = (int) f.n_ff;
+        rd.n_embd = (int) f.n_embd;
+        auto read_fn = [](void* ctx, int w, int W, const std::atomic<bool>& stop) {   // gate/up half-rows per CCD, then down
             Read& r = *(Read*) ctx;
             uint64_t x = 0;
-            for (int part = 0; part < 2 && !stop.load(); ++part) {
-                const size_t r0 = part == 0 ? 0 : r.down_off, r1 = part == 0 ? r.down_off : r.bytes;
-                const size_t per = ((r1 - r0 + (size_t) W - 1) / (size_t) W + 63) & ~(size_t) 63;
-                const size_t b0 = std::min(r1, r0 + per * (size_t) w), b1 = std::min(r1, b0 + per);
-                for (size_t o = b0; o + 8 <= b1; o += 64) x += *(const volatile uint64_t*) (r.blob + o);
+            int ccd_w = W;
+            const int rank = r.pool->ccd_worker_rank(w, W, ccd_w);
+            const int ccd = r.pool->worker_ccd(w);
+            const bool dual = r.pool->dual_ccd() && ccd_w > 0;
+            auto touch_span = [&](size_t s0, size_t s1) {
+                const size_t per = ((s1 - s0 + (size_t) ccd_w - 1) / (size_t) ccd_w + 63) & ~(size_t) 63;
+                const size_t b0 = std::min(s1, s0 + per * (size_t) rank), b1 = std::min(s1, b0 + per);
+                for (size_t o = b0; o + 8 <= b1 && !stop.load(std::memory_order_relaxed); o += 64)
+                    x += *(const volatile uint64_t*) (r.blob + o);
+            };
+            if (dual) {
+                const int gu_mid = cpu::ExpertPool::ccd_split_row(r.n_ff);
+                const int d_mid = cpu::ExpertPool::ccd_split_row(r.n_embd);
+                const size_t g0 = ccd == 0 ? 0 : (size_t) gu_mid * r.gu_row;
+                const size_t g1 = ccd == 0 ? (size_t) gu_mid * r.gu_row : (size_t) r.n_ff * r.gu_row;
+                touch_span(g0, g1);
+                touch_span(r.up_off + g0, r.up_off + g1);
+                const size_t d0 = r.down_off + (ccd == 0 ? 0 : (size_t) d_mid * r.d_row);
+                const size_t d1 = ccd == 0 ? (r.down_off + (size_t) d_mid * r.d_row) : r.bytes;
+                touch_span(d0, d1);
+            } else {
+                for (int part = 0; part < 2 && !stop.load(std::memory_order_relaxed); ++part) {
+                    const size_t r0 = part == 0 ? 0 : r.down_off, r1 = part == 0 ? r.down_off : r.bytes;
+                    touch_span(r0, r1);
+                }
             }
             r.sink.fetch_add(x);
             r.done.fetch_add(1);
         };
-        cpu::ExpertPool pool((std::max)(1, (int) cpu::physical_cores(true).size()));
         std::vector<double> cold, readus, warm;
         int pick = 0;
         for (int it = 0; it < 40; ++it) {
