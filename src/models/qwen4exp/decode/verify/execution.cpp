@@ -250,12 +250,15 @@ int Verifier::serve_poll(PoolMultiFn pool, void* user, std::string& err) {
         fl_.waiting = false;
         const Clock::time_point a = fl_.wait_t0;
         const Clock::time_point b = Clock::now();
+        if (dm_ != nullptr && dm_->warm != nullptr && warm_pool_ != nullptr) warm_pool_->idle_signal_stop();
         cur_layer_ = want - 1;
         set_plan_slot();
         const int n = T;
         progress_at("verify window: the CPU experts of layer", l);
         if (dm_ != nullptr) {   // the ring's own rows and tiers: the pool computes the CPU's entries only
             const basalt::kernels::DmRing& R = dm_->h_ring[k];
+            if (dm_->warm != nullptr && dm_->warm->stats_on)
+                warm_record_actual(*dm_->warm, (int) l, R.ids, R.kind, n * (int) ss.k);
             sink_.ext_kind = R.kind;
             if (pool != nullptr)
                 pool(user, dm_->h_x + (size_t) k * dm_->x_stride, R.ids, n, ss.k, h_ymiss_, l);
@@ -298,7 +301,7 @@ int Verifier::serve_poll(PoolMultiFn pool, void* user, std::string& err) {
             w.res1 = dm_->pdev >= 0 ? dm_->shadow1.data() + (size_t) (l + 1) * g.n_expert : nullptr;
             w.arrive.store(0, std::memory_order_relaxed);
             w.ready.store(0, std::memory_order_relaxed);
-            w.blob = nullptr;
+            w.n_blobs = 0;
             warm_pool_->idle_start(&warm_job, &w);
         }
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();

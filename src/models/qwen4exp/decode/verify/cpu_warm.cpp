@@ -36,7 +36,7 @@ BASALT_TARGET_AVX2_FMA_F16C void warm_logits(CpuWarm& c, int e0, int e1, const s
             const __m256i wh = _mm256_cvtepi8_epi16(qh);
             const float sw = S[(size_t) e * NB + b];
             for (int t = 0; t < pt; ++t) {
-                const uint8_t* blk = c.xq + ((size_t) t * NB + b) * 36;   // block_q8_1: half d, half s, 32 x int8
+                const uint8_t* blk = c.xq + ((size_t) t * NB + b) * 36;
                 uint16_t dh;
                 std::memcpy(&dh, blk, 2);
                 const __m256i x = _mm256_loadu_si256((const __m256i*) (blk + 4));
@@ -54,9 +54,11 @@ BASALT_TARGET_AVX2_FMA_F16C void warm_logits(CpuWarm& c, int e0, int e1, const s
     }
 }
 
-// every token's top k (softmax weights over them), summed per predicted expert only the CPU holds; the likeliest
 void warm_select(CpuWarm& c) {
     const int NE = c.n_expert, K = std::min(c.k, 16);
+    const int want = std::clamp(c.max_warm, 0, CpuWarm::kMaxBlobs);
+    c.n_blobs = 0;
+    if (want <= 0) return;
     float score[512] = {};
     for (int t = 0; t < c.n_tok; ++t) {
         const float* lg = c.logits.data() + (size_t) t * NE;
@@ -75,18 +77,72 @@ void warm_select(CpuWarm& c) {
         for (int j = 0; j < m; ++j) sum += (w[j] = std::exp(val[j] - val[0]));
         for (int j = 0; j < m; ++j) {
             const int e = top[j];
-            if (c.res0[e] >= 0 || (c.res1 != nullptr && c.res1[e] >= 0)) continue;   // a GPU holds it
+            if (c.res0[e] >= 0 || (c.res1 != nullptr && c.res1[e] >= 0)) continue;
             score[e] += w[j] / sum;
         }
     }
-    int best = -1;
-    for (int e = 0; e < NE; ++e)
-        if (score[e] > 0.0f && (best < 0 || score[e] > score[best])) best = e;
-    c.blob = best >= 0 ? c.src->resident_blob(c.layer, best) : nullptr;
+    int best_id[CpuWarm::kMaxBlobs];
+    float best_sc[CpuWarm::kMaxBlobs];
+    int nb = 0;
+    for (int e = 0; e < NE; ++e) {
+        const float sc = score[e];
+        if (sc <= 0.0f) continue;
+        if (nb == want && sc <= best_sc[want - 1]) continue;
+        int j = nb < want ? nb++ : want - 1;
+        while (j > 0 && best_sc[j - 1] < sc) { best_sc[j] = best_sc[j - 1]; best_id[j] = best_id[j - 1]; --j; }
+        best_sc[j] = sc;
+        best_id[j] = e;
+    }
+    int out = 0;
+    for (int i = 0; i < nb; ++i) {
+        const uint8_t* b = c.src->resident_blob(c.layer, best_id[i]);
+        if (b != nullptr) {
+            c.blobs[out] = b;
+            c.blob_ids[out] = best_id[i];
+            ++out;
+        }
+    }
+    c.n_blobs = out;
+    if (c.stats_on) {
+        c.stat_layer = c.layer;
+        c.stat_n = out;
+        for (int i = 0; i < out; ++i) c.stat_ids[i] = c.blob_ids[i];
+    }
+}
+
+void warm_record_actual(CpuWarm& c, int layer, const int32_t* ids, const int32_t* kind, int n_entries) {
+    if (!c.stats_on || c.stat_layer != layer) return;
+    int seen[128];
+    int ns = 0;
+    for (int i = 0; i < n_entries && ns < 128; ++i) {
+        if (kind[i] >= 0 || ids[i] < 0) continue;
+        bool dup = false;
+        for (int j = 0; j < ns; ++j) if (seen[j] == ids[i]) { dup = true; break; }
+        if (!dup) seen[ns++] = ids[i];
+    }
+    ++c.stat_layers;
+    if (ns > 0) ++c.stat_layers_with_miss;
+    c.stat_miss_experts += (uint64_t) ns;
+    for (int j = 0; j < ns; ++j) {
+        if (c.stat_n > 0 && seen[j] == c.stat_ids[0]) ++c.stat_top1_hits;
+        for (int k = 0; k < c.stat_n; ++k) {
+            if (seen[j] == c.stat_ids[k]) { ++c.stat_topk_hits; break; }
+        }
+    }
+    if ((c.stat_layers % 9600ull) == 0) {
+        const double miss = (double) std::max<uint64_t>(1, c.stat_miss_experts);
+        const double touched_mb = (double) c.stat_bytes_touched.load(std::memory_order_relaxed) / 1e6;
+        basalt::log::info("basalt warm", "layers=%llu (with_miss=%llu) actual_cpu_experts=%llu top1_hit=%.1f%% top%d_hit=%.1f%% avg_warmed=%.2f MB/layer",
+                          (unsigned long long) c.stat_layers, (unsigned long long) c.stat_layers_with_miss,
+                          (unsigned long long) c.stat_miss_experts,
+                          100.0 * (double) c.stat_top1_hits / miss, c.max_warm,
+                          100.0 * (double) c.stat_topk_hits / miss, touched_mb / (double) c.stat_layers);
+    }
 }
 
 void warm_job(void* ctx, int w, int W, const std::atomic<bool>& stop) {
     CpuWarm& c = *(CpuWarm*) ctx;
+    if (c.max_warm <= 0 || W <= 0) return;
     warm_logits(c, c.n_expert * w / W, c.n_expert * (w + 1) / W, stop);
     if (c.arrive.fetch_add(1, std::memory_order_acq_rel) + 1 == W) {
         if (!stop.load(std::memory_order_relaxed)) warm_select(c);
@@ -97,27 +153,62 @@ void warm_job(void* ctx, int w, int W, const std::atomic<bool>& stop) {
             _mm_pause();
         }
     }
-    // this worker's share of the blob, one load per line: the gate and up rows first (computed first), then the down
-    // rows, so a read the doorbell cuts short has warmed the start of the computation
-    if (c.blob == nullptr) return;
-    uint64_t x = 0;
-    for (int part = 0; part < 2; ++part) {
-        const size_t r0 = part == 0 ? 0 : c.down_off, r1 = part == 0 ? c.down_off : c.bytes;
-        const size_t per = ((r1 - r0 + (size_t) W - 1) / (size_t) W + 63) & ~(size_t) 63;
-        const size_t b0 = std::min(r1, r0 + per * (size_t) w), b1 = std::min(r1, b0 + per);
-        for (size_t o = b0; o < b1; o += 4096) {
-            if (stop.load(std::memory_order_relaxed)) { part = 2; break; }
-            const uint8_t* p = c.blob + o;
-            const size_t n = std::min<size_t>(4096, b1 - o);
-            for (size_t q = 0; q + 8 <= n; q += 64) x += *(const volatile uint64_t*) (p + q);
+    const int nb = c.n_blobs;
+    if (nb <= 0) return;
+
+    int ccd_w = W;
+    int rank = w;
+    int ccd = 0;
+    const bool dual = c.pool != nullptr && c.pool->dual_ccd() && c.gu_row > 0 && c.d_row > 0 && c.n_ff >= 32;
+    if (dual) {
+        rank = c.pool->ccd_worker_rank(w, W, ccd_w);
+        ccd = c.pool->worker_ccd(w);
+        if (ccd_w <= 0) return;
+        if (c.warm_w_per_ccd > 0 && c.warm_w_per_ccd < ccd_w) {
+            if (rank >= c.warm_w_per_ccd) return;
+            ccd_w = c.warm_w_per_ccd;
         }
+    } else if (c.warm_w_per_ccd > 0 && 2 * c.warm_w_per_ccd < ccd_w) {
+        if (rank >= 2 * c.warm_w_per_ccd) return;
+        ccd_w = 2 * c.warm_w_per_ccd;
     }
-    if (x == 0x9e3779b97f4a7c15ull) c.sink.fetch_add(x, std::memory_order_relaxed);   // keeps the loads
+
+    const int gu_mid = basalt::kernels::cpu::ExpertPool::ccd_split_row(c.n_ff);
+    const int d_mid = basalt::kernels::cpu::ExpertPool::ccd_split_row(c.n_embd);
+    const size_t g0 = dual ? (ccd == 0 ? 0 : (size_t) gu_mid * c.gu_row) : 0;
+    const size_t g1 = dual ? (ccd == 0 ? (size_t) gu_mid * c.gu_row : (size_t) c.n_ff * c.gu_row) : c.up_off;
+    const size_t u0 = c.up_off + g0;
+    const size_t u1 = c.up_off + g1;
+    const size_t d0 = c.down_off + (dual ? (ccd == 0 ? 0 : (size_t) d_mid * c.d_row) : 0);
+    const size_t d1 = dual ? (ccd == 0 ? (c.down_off + (size_t) d_mid * c.d_row) : c.bytes) : c.bytes;
+
+    uint64_t x = 0;
+    uint64_t touched = 0;
+    auto touch_span = [&](const uint8_t* blob, size_t s0, size_t s1) -> bool {
+        if (s1 <= s0) return true;
+        const size_t per = ((s1 - s0 + (size_t) ccd_w - 1) / (size_t) ccd_w + 63) & ~(size_t) 63;
+        const size_t b0 = std::min(s1, s0 + per * (size_t) rank), b1 = std::min(s1, b0 + per);
+        for (size_t o = b0; o < b1; o += 512) {
+            if (stop.load(std::memory_order_relaxed)) return false;
+            const uint8_t* p = blob + o;
+            const size_t n = std::min<size_t>(512, b1 - o);
+            for (size_t q = 0; q + 8 <= n; q += 64) x += *(const volatile uint64_t*) (p + q);
+            touched += n;
+        }
+        return true;
+    };
+
+    for (int bi = 0; bi < nb; ++bi) {
+        const uint8_t* blob = c.blobs[bi];
+        if (blob == nullptr) continue;
+        if (!touch_span(blob, g0, g1)) break;
+        if (c.up_off > 0 && !touch_span(blob, u0, u1)) break;
+        if (!touch_span(blob, d0, d1)) break;
+    }
+    if (c.stats_on && touched > 0) c.stat_bytes_touched.fetch_add(touched, std::memory_order_relaxed);
+    if (x == 0x9e3779b97f4a7c15ull) c.sink.fetch_add(x, std::memory_order_relaxed);
 }
 
-// Every layer's BF16 router [n_expert x n_embd] with one scale per 32 values, read once: as int8 codes for the peer's
-// warm-up (`q8`, `s8`) and as 4-bit codes in CpuWarm's layout for the CPU pool's (`q4`, `s4`); either may be null.  A
-// prediction only.  False when a layer's router is not such a table.
 bool router_codes(const WeightTable& wt, const ModelGeometry& g, std::vector<int8_t>* q8, std::vector<float>* s8,
                   std::vector<uint8_t>* q4, std::vector<float>* s4) {
     const int64_t N = g.n_embd, NE = g.n_expert, L = g.n_layers, NB = N / 32;
@@ -153,7 +244,7 @@ bool router_codes(const WeightTable& wt, const ModelGeometry& g, std::vector<int
                     for (int i = 0; i < 32; ++i)
                         (*q8)[blk * 32 + (size_t) i] = (int8_t) (d > 0.0f ? std::lrintf(v[i] / d) : 0);
                 }
-                if (q4 != nullptr) {   // value i in the low nibble of byte i, value i + 16 in its high nibble, code + 8
+                if (q4 != nullptr) {
                     const float d = amax / 7.0f;
                     (*s4)[blk] = d;
                     uint8_t* out = q4->data() + blk * 16;
@@ -167,7 +258,6 @@ bool router_codes(const WeightTable& wt, const ModelGeometry& g, std::vector<int
     return true;
 }
 
-// The peer warm-up's predictor rows (router_codes' int8 ones) on the current device.
 bool warm_router(const std::vector<int8_t>& q, const std::vector<float>& sc, int8_t** rq, float** rs) {
     if (cudaMalloc((void**) rq, q.size()) != cudaSuccess || cudaMalloc((void**) rs, sc.size() * 4) != cudaSuccess ||
         cudaMemcpy(*rq, q.data(), q.size(), cudaMemcpyHostToDevice) != cudaSuccess ||

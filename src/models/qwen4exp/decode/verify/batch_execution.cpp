@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <string>
 #include <immintrin.h>
 
@@ -170,6 +171,13 @@ bool Verifier::run_slot_segs(const int* rows, const int* lens, int S, const int3
     volatile uint32_t* const flag = h_flag_;
     const int64_t steps = ar_on() ? 0 : le_ - lb_;   // the zero-doorbell graph rings no layer
     if (ar_on()) ar_handoff();
+    const char* no_bw = std::getenv("BASALT_NO_BATCH_WARM");
+    const bool batch_warm_on = dm && dm_->warm != nullptr && warm_pool_ != nullptr &&
+                               !(no_bw != nullptr && no_bw[0] == '1' && no_bw[1] == '\0');
+    struct WarmGuard {
+        basalt::kernels::cpu::ExpertPool* p;
+        ~WarmGuard() { if (p != nullptr) p->idle_stop(); }
+    } warm_guard{batch_warm_on ? warm_pool_ : nullptr};
     for (int64_t k = 0; k < steps; ++k) {
         const int64_t l = lb_ + k;
         const uint32_t want = (uint32_t) (k + 1);
@@ -196,11 +204,14 @@ bool Verifier::run_slot_segs(const int* rows, const int* lens, int S, const int3
             }
         }
         const Clock::time_point b = Clock::now();
+        if (batch_warm_on) warm_pool_->idle_signal_stop();
         cur_layer_ = want - 1;
         set_plan_slot();
         progress_at("verify batch: the CPU experts of layer", l);
         if (dm) {   // the ring's own rows and tiers: the pool computes the CPU's entries only
             const basalt::kernels::DmRing& Rg = dm_->h_ring[k];
+            if (batch_warm_on && dm_->warm->stats_on)
+                warm_record_actual(*dm_->warm, (int) l, Rg.ids, Rg.kind, R * (int) ss_->k);
             sink_.ext_kind = Rg.kind;
             if (pool != nullptr) pool(user, dm_->h_x + (size_t) k * dm_->x_stride, Rg.ids, R, ss_->k, h_ymiss_, l);
             sink_.ext_kind = nullptr;
@@ -219,9 +230,23 @@ bool Verifier::run_slot_segs(const int* rows, const int* lens, int S, const int3
             raise_flag(h_flagB_, want);
         }
         *flag = want;
+        if (batch_warm_on && l + 1 < le_) {
+            CpuWarm& w = *dm_->warm;
+            warm_pool_->idle_stop();
+            w.layer = (int) (l + 1);
+            w.n_tok = std::min(R, (int) kVerifyMaxT);
+            w.xq = dm_->h_xq + (size_t) k * dm_->xq_stride;
+            w.res0 = dm_->shadow0.data() + (size_t) (l + 1) * g.n_expert;
+            w.res1 = dm_->pdev >= 0 ? dm_->shadow1.data() + (size_t) (l + 1) * g.n_expert : nullptr;
+            w.arrive.store(0, std::memory_order_relaxed);
+            w.ready.store(0, std::memory_order_relaxed);
+            w.n_blobs = 0;
+            warm_pool_->idle_start(&warm_job, &w);
+        }
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
     }
+    if (batch_warm_on) warm_pool_->idle_stop();
     progress_at("verify batch: waiting for the GPU to finish the window", R);
     const cudaError_t se = cudaStreamSynchronize(cs_);
     const bool dm_ok = !dm || dm_end(err);

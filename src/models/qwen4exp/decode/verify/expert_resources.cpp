@@ -189,9 +189,17 @@ bool Verifier::dm_init(std::string& err) {
         CpuWarm* w = new CpuWarm;
         w->rq = std::move(rq4_h);
         w->rs = std::move(rs4_h);
-        w->n_expert = (int) g.n_expert; w->n_embd = (int) N; w->k = (int) K; w->src = warm_src_;
+        w->n_expert = (int) g.n_expert; w->n_embd = (int) N; w->n_ff = (int) lay.fmt[0].n_ff; w->k = (int) K;
+        w->src = warm_src_;
+        w->pool = warm_pool_;
         w->bytes = lay.fmt[0].bytes;
+        w->up_off = lay.fmt[0].up_off;
         w->down_off = lay.fmt[0].down_off;
+        w->gu_row = lay.fmt[0].gu_row;
+        w->d_row = lay.fmt[0].d_row;
+        if (const char* wk = std::getenv("BASALT_WARM_K")) w->max_warm = std::clamp(std::atoi(wk), 0, CpuWarm::kMaxBlobs);
+        if (const char* ww = std::getenv("BASALT_WARM_W_PER_CCD")) w->warm_w_per_ccd = std::max(0, std::atoi(ww));
+        if (const char* ws = std::getenv("BASALT_WARM_STATS")) w->stats_on = ws[0] == '1' && ws[1] == '\0';
         w->logits.assign((size_t) kVerifyMaxT * g.n_expert, 0.0f);
         d->warm = w;
     }
